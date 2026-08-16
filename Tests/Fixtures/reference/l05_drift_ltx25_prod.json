@@ -1,0 +1,204 @@
+{
+ "preset": {
+  "width": 640,
+  "height": 384,
+  "num_frames": 97,
+  "seed": 0
+ },
+ "perturb_seed": 7,
+ "noise_dtype": "torch.bfloat16",
+ "noise_dtype_eps": 0.0078125,
+ "noise_floors": {
+  "1": 0.0,
+  "2": 0.0,
+  "4": 0.0,
+  "8": 0.0
+ },
+ "baseline_repeats": 3,
+ "rows": [
+  {
+   "steps": 1,
+   "eps": 1e-06,
+   "injected_rel": {
+    "noise": 4.175520656781301e-09
+   },
+   "final_video_rel": 0.015116287452757811,
+   "final_audio_rel": 0.02408383929200472,
+   "amplification_video": 3620216.1826712643,
+   "noise_floor": 0.0
+  },
+  {
+   "steps": 1,
+   "eps": 0.01,
+   "injected_rel": {
+    "noise": 0.010139095852744076
+   },
+   "final_video_rel": 0.01889622801700963,
+   "final_audio_rel": 0.029074498633538004,
+   "amplification_video": 1.863699514379825,
+   "noise_floor": 0.0
+  },
+  {
+   "steps": 1,
+   "eps": 0.03,
+   "injected_rel": {
+    "noise": 0.030077640281525424
+   },
+   "final_video_rel": 0.03447857079055885,
+   "final_audio_rel": 0.041349945311160895,
+   "amplification_video": 1.1463190086669335,
+   "noise_floor": 0.0
+  },
+  {
+   "steps": 1,
+   "eps": 0.1,
+   "injected_rel": {
+    "noise": 0.09999181784107689
+   },
+   "final_video_rel": 0.10155878941601809,
+   "final_audio_rel": 0.10462491793170108,
+   "amplification_video": 1.0156709979753713,
+   "noise_floor": 0.0
+  },
+  {
+   "steps": 2,
+   "eps": 1e-06,
+   "injected_rel": {
+    "noise": 4.175520656781301e-09
+   },
+   "final_video_rel": 0.03275641873608854,
+   "final_audio_rel": 0.058485594333659574,
+   "amplification_video": 7844870.479299417,
+   "noise_floor": 0.0
+  },
+  {
+   "steps": 2,
+   "eps": 0.01,
+   "injected_rel": {
+    "noise": 0.010139095852744076
+   },
+   "final_video_rel": 0.034866057408197246,
+   "final_audio_rel": 0.0670177871915856,
+   "amplification_video": 3.43877382308808,
+   "noise_floor": 0.0
+  },
+  {
+   "steps": 2,
+   "eps": 0.03,
+   "injected_rel": {
+    "noise": 0.030077640281525424
+   },
+   "final_video_rel": 0.0405966522111529,
+   "final_audio_rel": 0.07495805971893475,
+   "amplification_video": 1.3497286300111968,
+   "noise_floor": 0.0
+  },
+  {
+   "steps": 2,
+   "eps": 0.1,
+   "injected_rel": {
+    "noise": 0.09999181784107689
+   },
+   "final_video_rel": 0.05393102274296714,
+   "final_audio_rel": 0.09197555567905054,
+   "amplification_video": 0.539354358260423,
+   "noise_floor": 0.0
+  },
+  {
+   "steps": 4,
+   "eps": 1e-06,
+   "injected_rel": {
+    "noise": 4.175520656781301e-09
+   },
+   "final_video_rel": 0.09029592622640135,
+   "final_audio_rel": 0.08148306571169321,
+   "amplification_video": 21625069.93702815,
+   "noise_floor": 0.0
+  },
+  {
+   "steps": 4,
+   "eps": 0.01,
+   "injected_rel": {
+    "noise": 0.010139095852744076
+   },
+   "final_video_rel": 0.09953052589355271,
+   "final_audio_rel": 0.08187554604775554,
+   "amplification_video": 9.816509020043979,
+   "noise_floor": 0.0
+  },
+  {
+   "steps": 4,
+   "eps": 0.03,
+   "injected_rel": {
+    "noise": 0.030077640281525424
+   },
+   "final_video_rel": 0.10508913000265992,
+   "final_audio_rel": 0.09890610636741197,
+   "amplification_video": 3.4939286798774827,
+   "noise_floor": 0.0
+  },
+  {
+   "steps": 4,
+   "eps": 0.1,
+   "injected_rel": {
+    "noise": 0.09999181784107689
+   },
+   "final_video_rel": 0.15159797781658862,
+   "final_audio_rel": 0.17329328975462324,
+   "amplification_video": 1.5161038281905481,
+   "noise_floor": 0.0
+  },
+  {
+   "steps": 8,
+   "eps": 1e-06,
+   "injected_rel": {
+    "noise": 4.175520656781301e-09
+   },
+   "final_video_rel": 0.17836979816528162,
+   "final_audio_rel": 0.11470915916866485,
+   "amplification_video": 42717977.66719179,
+   "noise_floor": 0.0
+  },
+  {
+   "steps": 8,
+   "eps": 0.01,
+   "injected_rel": {
+    "noise": 0.010139095852744076
+   },
+   "final_video_rel": 0.2758845763951407,
+   "final_audio_rel": 0.130558444440727,
+   "amplification_video": 27.20997812842202,
+   "noise_floor": 0.0
+  },
+  {
+   "steps": 8,
+   "eps": 0.03,
+   "injected_rel": {
+    "noise": 0.030077640281525424
+   },
+   "final_video_rel": 0.323146980865328,
+   "final_audio_rel": 0.3653714705162318,
+   "amplification_video": 10.743761074362421,
+   "noise_floor": 0.0
+  },
+  {
+   "steps": 8,
+   "eps": 0.1,
+   "injected_rel": {
+    "noise": 0.09999181784107689
+   },
+   "final_video_rel": 0.42254834602997043,
+   "final_audio_rel": 0.3044421844610761,
+   "amplification_video": 4.225829224362661,
+   "noise_floor": 0.0
+  }
+ ],
+ "verdicts": {
+  "1": "saturated",
+  "2": "saturated",
+  "4": "saturated",
+  "8": "saturated"
+ },
+ "l3a_step_ceiling": null,
+ "note": "Read the ABSOLUTE final columns, not the amplification ratio: dividing a saturated output by a tiny input yields a huge number that means nothing. That mistake has been made on this exact table."
+}

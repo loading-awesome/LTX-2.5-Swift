@@ -1,0 +1,50 @@
+# Build products. `.build/checkouts` is where the patched mlx-swift lives, which is
+# why `tools/check-mlx-patch.sh` exists — nothing in this repository can hold that
+# patch applied, so a clean checkout silently loses it.
+.build/
+.swiftpm/
+*.xcodeproj
+xcuserdata/
+*.xcuserdatad
+
+# macOS
+.DS_Store
+
+# Python (tools/ltx_probe.py)
+__pycache__/
+*.pyc
+
+# Local configuration. `ltx doctor --write-config` writes to ~/.config/ltx/config.json
+# by default, but `--config ./something.json` puts one here, and a config file names
+# one machine's checkpoint tree.
+/config.json
+/ltx.json
+.env
+
+# Render output. Every generating command writes an mp4 with a provenance sidecar
+# beside it, and `ltx bench` writes a record; none of it belongs in the repository.
+#
+# `demo-media/` is the exception and is committed: the clips in the README are the
+# only evidence a reader gets before downloading 100 GB of weights. Their provenance
+# sidecars are committed too — they carry the seed, the recipe and the checkpoint
+# identities, so a claim in the README can be checked rather than taken.
+*.mp4
+*.wav
+*.provenance.json
+*.bench.json
+*.time.txt
+*.waveform.safetensors
+!demo-media/**
+runs/
+out/
+
+# Checkpoints and adapters, in case anything is ever unpacked in-tree. Model weights
+# are not distributed here — see the README.
+*.safetensors
+*.gguf
+!Tests/Fixtures/**/*.safetensors
+
+# Training caches: `TrainingCacheBuilder` writes encoded latents and text features,
+# which are large and are derived from the clips plus the checkpoints.
+cache/
+*.ltx-cache/
