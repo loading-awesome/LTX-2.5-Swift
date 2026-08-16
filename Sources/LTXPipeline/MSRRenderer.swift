@@ -5,6 +5,7 @@ import Foundation
 import LTXCatalog
 import LTXFoundation
 import LTXModules
+import LTXRecipes
 import MLX
 
 /// Render from a prompt and **a cast** — up to five reference stills, each held apart.
@@ -82,7 +83,9 @@ public enum MSRRenderer {
         public var background: URL?
         public var prompt: String
         public var output: URL
+        /// The **output** width — what gets written.
         public var width: Int
+        /// The **output** height.
         public var height: Int
         public var frames: Int
         public var frameRate: Double
@@ -92,23 +95,73 @@ public enum MSRRenderer {
         /// holds them perfectly clean, which is the default.
         public var strength: Float
         public var referenceFrames: ReferenceFrames
+        /// Non-nil runs on the dev transformer's continuous schedule with real guidance
+        /// instead of the distilled draft table. Four forwards per step rather than one;
+        /// the slot conditioning is unchanged.
+        public var guided: VideoUpscaler.Guided?
+        /// Whether the recipe declared a refine stage after the draft.
+        ///
+        /// For the reason ``IngredientsRenderer/Options/twoStage`` gives: it makes a larger
+        /// output cheaper than rendering it natively, and does not make a given output
+        /// faster. The `msr-prod` recipes are single stage for that reason.
+        ///
+        /// **It costs more here than it does there.** Stage 2 re-prepares, re-encodes and
+        /// re-tags every slot at the output resolution, because `reference_downscale_factor`
+        /// is 1 and a reference must sit on its own stage's grid — so a five-slot cast pays
+        /// five encodes twice. That is real, and it is still the cheaper half of the trade:
+        /// the encodes are seconds and the steps they save are minutes.
+        public var twoStage: Bool
+        /// Stage-2 steps. The stage-2 table is four sigmas long, so 3 is the schedule
+        /// rather than a sample of it.
+        public var refineSteps: Int
 
+        /// The width stage 1 samples at, from the first stage's `scale`.
+        public var sampledWidth: Int
+        /// The height stage 1 samples at, from the first stage's `scale`.
+        public var sampledHeight: Int
+        /// Stage 1's sigmas, from the recipe's own `SigmaPlan`.
+        public var stage1Sigmas: [Float]
+        /// Stage 2's sigmas when a refine follows, scaled to the re-noise level.
+        public var stage2Sigmas: [Float]?
+
+        /// Every shape, schedule and guidance setting from a resolved recipe. See
+        /// ``IngredientsRenderer/Options/init(reference:prompt:output:plan:seed:strength:negativePrompt:)``
+        /// for why the geometry is not a parameter.
         public init(references: [URL], background: URL? = nil, prompt: String, output: URL,
-                    width: Int, height: Int, frames: Int, frameRate: Double = 24,
-                    steps: Int = 3, seed: UInt64 = 42, strength: Float = 1.0,
-                    referenceFrames: ReferenceFrames = .standard) {
+                    plan: ResolvedRecipe,
+                    seed: UInt64 = 42, strength: Float = 1.0,
+                    referenceFrames: ReferenceFrames = .standard,
+                    negativePrompt: String = "") throws {
+            guard let first = plan.stages.first else {
+                throw Failure.noStages(recipe: plan.recipeID)
+            }
             self.references = references
             self.background = background
             self.prompt = prompt
             self.output = output
-            self.width = width
-            self.height = height
-            self.frames = frames
-            self.frameRate = frameRate
-            self.steps = steps
+            self.width = plan.output.width
+            self.height = plan.output.height
+            self.sampledWidth = first.shape.width
+            self.sampledHeight = first.shape.height
+            self.frames = plan.frames
+            self.frameRate = plan.frameRate
             self.seed = seed
             self.strength = strength
             self.referenceFrames = referenceFrames
+            self.twoStage = plan.stages.count > 1
+            self.steps = first.stage.sigmas.steps
+            self.stage1Sigmas = try first.stage.sigmas.sigmas()
+            let refine = plan.stages.dropFirst().first
+            self.stage2Sigmas = try refine.map {
+                try $0.stage.sigmas.sigmas(denoise: FlowSchedule.distilledStage2[0])
+            }
+            self.refineSteps = refine?.stage.sigmas.steps ?? 0
+            let videoGuide = first.stage.videoGuidance
+            self.guided = videoGuide == .distilled ? nil : VideoUpscaler.Guided(
+                negativePrompt: negativePrompt,
+                video: GuidanceParams(videoGuide),
+                audio: GuidanceParams(first.stage.audioGuidance),
+                steps: first.stage.sigmas.steps)
         }
 
         /// Every reference in slot order, with the background last, and whether each is one.
@@ -124,9 +177,14 @@ public enum MSRRenderer {
         case referenceLatentFrames(slot: Int, got: Int, want: Int)
         case checkpointMissing(String, path: String)
         case audioCheckpointMissing
+        case noStages(recipe: String)
 
         public var description: String {
             switch self {
+            case let .noStages(recipe):
+                // The grid check that used to live here is `RecipeStage.shape(forOutput:)`
+                // now, run during resolution against every stage including a halved one.
+                return "recipe '\(recipe)' declares no stages to sample"
             case .noReferences:
                 return "MSR needs at least one reference still. With none, this is an "
                     + "ordinary render and `ltx render` is that path."
@@ -158,8 +216,14 @@ public enum MSRRenderer {
         public let frameOffsets: [Int]
         public let slotNorms: [Float]
         public let framesWritten: Int
+        /// What was written. Stage 1 sampled at half these when ``Options/twoStage``.
+        public let outputWidth: Int
+        public let outputHeight: Int
         public let encodeSeconds: Double
         public let sampleSeconds: Double
+        /// The x2 upsample, the stage-2 re-encode of every slot, and the refine. Zero
+        /// when single-stage.
+        public let refineSeconds: Double
         public let decodeSeconds: Double
         public let peakGB: Double
     }
@@ -224,6 +288,75 @@ public enum MSRRenderer {
         return still
     }
 
+    /// Every slot prepared, encoded and tagged **at one stage's resolution**.
+    ///
+    /// Called once per stage rather than once per render. `reference_downscale_factor` is 1
+    /// on this adapter, so a reference's latent grid is the stage's own dimensions over the
+    /// VAE's 32 — carrying stage 1's half-size latents into a full-size stage 2 would append
+    /// a token block whose coordinates describe a grid the target no longer has.
+    ///
+    /// The slot vector is re-applied here rather than carried, for the same reason: it is
+    /// added on the channel axis *before* patchify so it broadcasts across that reference's
+    /// spatial positions, and stage 2 has four times as many of them.
+    static func encodedSlots(_ options: Options, width: Int, height: Int,
+                             embedding: ReferenceSlotEmbedding, videoVAE: URL,
+                             note: ((String) -> Void)?) throws
+        -> (latents: [MLXArray], norms: [Float]) {
+        let slots = options.slots
+        var latents: [MLXArray] = []
+        var norms: [Float] = []
+        let encoder = try VideoVAEEncoder(checkpoint: videoVAE)
+        for (index, slot) in slots.enumerated() {
+            let rgb = try prepared(image: slot.url, width: width, height: height,
+                                   isBackground: slot.isBackground,
+                                   frames: options.referenceFrames.rawValue)
+            // bf16 in, for the reason every encode here uses it: an fp32 clip promotes all
+            // 42 convolutions and computes more precisely than the encoder is meant to.
+            var latent = try encoder.encode(encoder.pixels(fromRGB: rgb).asType(.bfloat16))
+            let vector = embedding(slotIndex: index)
+            MLX.eval(vector)
+            norms.append(MLX.sqrt((vector * vector).sum()).item(Float.self))
+            latent = try embedding.applied(to: latent, slotIndex: index)
+            MLX.eval(latent)
+            latents.append(latent)
+            note?("  slot \(index + 1)"
+                + (slot.isBackground ? " (background)" : "")
+                + " \(slot.url.lastPathComponent) -> \(latent.shape),"
+                + String(format: " embedding norm %.4f", norms[index]))
+        }
+        MLX.Memory.clearCache()
+
+        // Every slot on the same grid. They are concatenated into one token block and their
+        // positions are built per block from the geometry's own record of each; a slot that
+        // encoded to a different number of latent frames would shift every later block's
+        // coordinates onto the wrong tokens, with no shape disagreeing.
+        let want = latents[0].dim(2)
+        for (index, latent) in latents.enumerated() where latent.dim(2) != want {
+            throw Failure.referenceLatentFrames(slot: index, got: latent.dim(2), want: want)
+        }
+        return (latents, norms)
+    }
+
+    /// The geometry for one stage, with each reference's slot vector and time offset recorded.
+    static func geometry(_ options: Options, width: Int, height: Int,
+                         references: [MLXArray]) -> DiTForward.Geometry {
+        var geometry = DiTForward.Geometry(frames: options.frames, height: height,
+                                           width: width, frameRate: options.frameRate)
+        let count = references.count
+        geometry.references = references.enumerated().map { index, latent in
+            DiTForward.Geometry.Reference(
+                latentFrames: latent.dim(2),
+                latentHeight: latent.dim(3),
+                latentWidth: latent.dim(4),
+                downscaleFactor: 1,
+                temporalScaleFactor: 1,
+                // `-(num_slots - slot_index)`: pic1 furthest back, the last slot at -1.
+                frameOffset: -(count - index),
+                slotIndex: index)
+        }
+        return geometry
+    }
+
     // MARK: - The run
 
     public static func render(_ options: Options,
@@ -238,12 +371,14 @@ public enum MSRRenderer {
         }
         // Every checkpoint first, before any work. Learned on the Ingredients path: a guard
         // that sits at the decode fires after both stages have run.
+        // No grid check: every stage's shape was validated during recipe resolution.
         guard let audioVAE = checkpoints.audioVAE else { throw Failure.audioCheckpointMissing }
         guard let adapterURL = checkpoints.icLoRA else {
             throw Failure.checkpointMissing("MSR adapter", path: "(not supplied)")
         }
         for (what, url) in [("video VAE", checkpoints.videoVAE), ("audio VAE", audioVAE),
-                            ("MSR adapter", adapterURL)] {
+                            ("MSR adapter", adapterURL)]
+            + (options.twoStage ? [("upsampler", checkpoints.upsampler)] : []) {
             guard FileManager.default.fileExists(atPath: url.path) else {
                 throw Failure.checkpointMissing(what, path: url.path)
             }
@@ -270,85 +405,104 @@ public enum MSRRenderer {
         note?("slot embedding: \(slotTensors.count) tensors, "
             + "\(embedding.latentChannels) channels")
 
-        // ---- References ----------------------------------------------------------------
+        // ---- References, at stage 1's resolution ----------------------------------------
         var t = Date()
-        note?("encoding \(slots.count) reference(s) at \(options.width)x\(options.height), "
+        note?("encoding \(slots.count) reference(s) at "
+            + "\(options.sampledWidth)x\(options.sampledHeight), "
             + "\(options.referenceFrames.rawValue) frames each")
-        var referenceLatents: [MLXArray] = []
-        var slotNorms: [Float] = []
-        let encoder = try VideoVAEEncoder(checkpoint: checkpoints.videoVAE)
-        for (index, slot) in slots.enumerated() {
-            let rgb = try prepared(image: slot.url, width: options.width,
-                                   height: options.height, isBackground: slot.isBackground,
-                                   frames: options.referenceFrames.rawValue)
-            // bf16 in, for the reason every encode here uses it: an fp32 clip promotes all
-            // 42 convolutions and computes more precisely than the encoder is meant to.
-            var latent = try encoder.encode(encoder.pixels(fromRGB: rgb).asType(.bfloat16))
-            // The tag, added on the channel axis of the latent and before patchify, so the
-            // vector broadcasts across every one of that reference's spatial positions.
-            let vector = embedding(slotIndex: index)
-            MLX.eval(vector)
-            slotNorms.append(MLX.sqrt((vector * vector).sum()).item(Float.self))
-            latent = try embedding.applied(to: latent, slotIndex: index)
-            MLX.eval(latent)
-            referenceLatents.append(latent)
-            note?("  slot \(index + 1)"
-                + (slot.isBackground ? " (background)" : "")
-                + " \(slot.url.lastPathComponent) -> \(latent.shape),"
-                + String(format: " embedding norm %.4f", slotNorms[index]))
-        }
-        MLX.Memory.clearCache()
+        let (referenceLatents, slotNorms) = try encodedSlots(
+            options, width: options.sampledWidth, height: options.sampledHeight,
+            embedding: embedding, videoVAE: checkpoints.videoVAE, note: note)
         let encodeSeconds = -t.timeIntervalSinceNow
-
-        // Every slot on the same grid. They are concatenated into one token block and their
-        // positions are built per block from the geometry's own record of each; a slot that
-        // encoded to a different number of latent frames would shift every later block's
-        // coordinates onto the wrong tokens, with no shape disagreeing.
-        let want = referenceLatents[0].dim(2)
-        for (index, latent) in referenceLatents.enumerated() where latent.dim(2) != want {
-            throw Failure.referenceLatentFrames(slot: index, got: latent.dim(2), want: want)
-        }
+        let count = referenceLatents.count
 
         // ---- Geometry ------------------------------------------------------------------
-        var geometry = DiTForward.Geometry(frames: options.frames,
-                                           height: options.height,
-                                           width: options.width,
-                                           frameRate: options.frameRate)
-        let count = referenceLatents.count
-        geometry.references = referenceLatents.enumerated().map { index, latent in
-            DiTForward.Geometry.Reference(
-                latentFrames: latent.dim(2),
-                latentHeight: latent.dim(3),
-                latentWidth: latent.dim(4),
-                downscaleFactor: 1,
-                temporalScaleFactor: 1,
-                // `-(num_slots - slot_index)`: pic1 furthest back, the last slot at -1.
-                frameOffset: -(count - index),
-                slotIndex: index)
-        }
+        let geometry = Self.geometry(options, width: options.sampledWidth,
+                                     height: options.sampledHeight,
+                                     references: referenceLatents)
         let offsets = geometry.references.map(\.frameOffset)
         note?("slot time offsets \(offsets) pixel frames "
             + "(\(offsets.map { String(format: "%.4f", Double($0) / options.frameRate) }) s)")
         note?("\(geometry.referenceTokens) reference tokens beside "
             + "\(geometry.videoTokens) generated")
 
-        // ---- Sample --------------------------------------------------------------------
+        // ---- Stage 1 -------------------------------------------------------------------
         t = Date()
+        note?(options.twoStage
+              ? "stage 1 at \(geometry.width)x\(geometry.height), half of the"
+                  + " \(options.width)x\(options.height) output"
+              : "single stage at \(geometry.width)x\(geometry.height)")
         let sampled = try VideoUpscaler.referenceGuided(
             references: referenceLatents, geometry: geometry, checkpoints: checkpoints,
             prompt: options.prompt, seed: options.seed, steps: options.steps,
-            referenceStrength: options.strength, overlay: overlay, note: note)
+            referenceStrength: options.strength,
+            explicitSigmas: options.stage1Sigmas, guided: options.guided,
+            overlay: overlay, note: note)
         MLX.eval(sampled.video, sampled.audio)
         MLX.Memory.clearCache()
         let sampleSeconds = -t.timeIntervalSinceNow
+
+        // ---- Stage 2: x2 upsample, re-encode the cast, refine ---------------------------
+        //
+        // The Ingredients path's shape, with the one difference that matters: the whole cast
+        // is re-prepared and re-tagged at the output resolution, not one sheet. The refine
+        // goes back through `referenceGuided` carrying the same slot conditioning stage 1
+        // had — `VideoUpscaler.refine` attaches no adapter and appends no reference, so it
+        // would denoise with a transformer that had never seen the cast and lose exactly the
+        // identities this command exists to hold.
+        var videoLatent = sampled.video
+        var audioLatent = sampled.audio
+        var outGeometry = geometry
+        var refineSeconds: Double = 0
+        if options.twoStage {
+            t = Date()
+            note?("x2 latent upsample")
+            let upscaled: MLXArray = try {
+                let upsampler = try LatentSpatialUpsampler(checkpoint: checkpoints.upsampler,
+                                                           videoVAE: checkpoints.videoVAE)
+                let out = try upsampler.upsample(videoLatent)
+                MLX.eval(out)
+                return out
+            }()
+            MLX.Memory.clearCache()
+
+            note?("re-encoding \(count) reference(s) at \(options.width)x\(options.height)")
+            let (stage2References, _) = try encodedSlots(
+                options, width: options.width, height: options.height,
+                embedding: embedding, videoVAE: checkpoints.videoVAE, note: note)
+            outGeometry = Self.geometry(options, width: options.width, height: options.height,
+                                        references: stage2References)
+
+            // Each schedule on the weights it belongs to — see the same seam on the
+            // Ingredients path. Both curves start at 0.909375, so stage 2 continues stage 1
+            // rather than re-rendering it, whichever recipe is running.
+            note?("stage 2 refine at \(outGeometry.width)x\(outGeometry.height)")
+            let stage2 = try VideoUpscaler.referenceGuided(
+                references: stage2References, geometry: outGeometry,
+                checkpoints: checkpoints, prompt: options.prompt,
+                seed: options.seed &+ DistilledRenderer.stage2NoiseSeedOffset,
+                steps: options.refineSteps, referenceStrength: options.strength,
+                initialVideo: try Sampler.patchifyVideo(upscaled),
+                explicitSigmas: options.stage2Sigmas,
+                guided: options.guided?.refining(steps: options.refineSteps),
+                overlay: overlay, note: note)
+            MLX.eval(stage2.video, stage2.audio)
+            MLX.Memory.clearCache()
+            videoLatent = stage2.video
+            // Stage 2 denoises the audio further even though it never upsamples it — the
+            // audio latent is a different rank and never meets the upsampler. Keeping stage
+            // 1's would throw away a refinement pass on the sound for no reason.
+            audioLatent = stage2.audio
+            refineSeconds = -t.timeIntervalSinceNow
+        }
 
         // ---- Decode --------------------------------------------------------------------
         t = Date()
         note?("decoding video")
         let pixels: MLXArray = try {
             let decoder = try VideoVAEDecoder(checkpoint: checkpoints.videoVAE)
-            let out = try Renderer.decodeVideoOnRecordedPolicy(decoder, sampled.video,
-                                                               geometry: geometry)
+            let out = try Renderer.decodeVideoOnRecordedPolicy(decoder, videoLatent,
+                                                               geometry: outGeometry)
             MLX.eval(out)
             return out
         }()
@@ -359,7 +513,7 @@ public enum MSRRenderer {
         note?("decoding audio")
         let mel: MLXArray = try {
             let decoder = try AudioVAEDecoder(checkpoint: audioVAE)
-            let out = try decoder.decode(sampled.audio)
+            let out = try decoder.decode(audioLatent)
             MLX.eval(out)
             return out
         }()
@@ -395,8 +549,11 @@ public enum MSRRenderer {
                       frameOffsets: offsets,
                       slotNorms: slotNorms,
                       framesWritten: pixels.dim(0),
+                      outputWidth: outGeometry.width,
+                      outputHeight: outGeometry.height,
                       encodeSeconds: encodeSeconds,
                       sampleSeconds: sampleSeconds,
+                      refineSeconds: refineSeconds,
                       decodeSeconds: decodeSeconds,
                       peakGB: Double(MLX.GPU.peakMemory) / 1e9)
     }

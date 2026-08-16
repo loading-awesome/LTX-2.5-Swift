@@ -315,7 +315,9 @@ public enum RecipeRegistry {
     public static let defaultID = "prod"
 
     public static var all: [Recipe] {
-        [production, devLoRA, distilled, ingredients, msr,
+        [production, devLoRA, distilled,
+         ingredients, ingredientsProd, ingredientsProdCFG,
+         msr, msrProd, msrProdCFG,
          upscalePlain, upscaleRefined, upscaleICLoRA]
     }
 
@@ -491,6 +493,67 @@ public enum RecipeRegistry {
         // causal VAE, and `IngredientsRenderer` refuses a reference that does not.
         contextReferences: Recipe.ContextReferences(minimum: 1, maximum: 1, latentFramesEach: 1))
 
+    /// ``ingredients`` on the **dev** transformer with production guidance, in one stage.
+    ///
+    /// **Single stage on purpose, and the reason is measured.** The two-stage arrangement
+    /// samples stage 1 at half the output and lets an x2 upsample plus a short refine carry
+    /// the rest. That is a good trade when the subject is soft and a bad one when it is
+    /// rigid: at half of 640x384 a mechanical subject occupies a 10x6 latent grid, which has
+    /// nowhere to put structure, and the refine re-noises to 0.909 and *invents* the missing
+    /// detail independently per frame. That is what melting is. A draft is not a smaller
+    /// picture, it is a picture with less structure in it.
+    ///
+    /// So the expensive route keeps its resolution and pays for it. ``ingredientsProdCFG``
+    /// is where the time comes back, by dropping passes rather than pixels.
+    public static let ingredientsProd = Recipe(
+        id: "ingredients-prod",
+        summary: "prompt + a reference sheet on the dev transformer, production guidance, "
+            + "one stage at full resolution — four forwards per step",
+        command: "ingredients",
+        stages: [
+            RecipeStage(name: "reference-guided",
+                        sigmas: .continuous(steps: 30),
+                        sampler: .euler,
+                        videoGuidance: .productionVideo,
+                        audioGuidance: .productionAudio,
+                        transformer: .dev,
+                        adapters: [
+                            AdapterRequest(filenameHint: "ic-lora-ingredients", strength: 1.0)
+                        ]),
+        ],
+        requires: [.transformer, .textEncoder, .videoVAECausal, .audioVAE, .lora],
+        contextReferences: Recipe.ContextReferences(minimum: 1, maximum: 1, latentFramesEach: 1))
+
+    /// ``ingredientsProd`` with CFG alone — **two forwards per step instead of four**.
+    ///
+    /// The one lever that buys back time without touching stage resolution. Measured on this
+    /// machine, the transformer runs at its GEMM ceiling (18.26 TFLOP/s against `bench gemm`'s
+    /// 18.26, with MPSGraph agreeing to 1.4%), so wall clock is pass count times tokens and
+    /// nothing else. Halving the passes halves the render.
+    ///
+    /// What is given up is real but secondary: STG and the modality term refine what CFG has
+    /// already placed, while CFG is what makes the render follow the prompt at all. Registered
+    /// as its own recipe rather than a flag so the name records what ran — see
+    /// ``RecipeGuidance/cfgOnlyVideo``.
+    public static let ingredientsProdCFG = Recipe(
+        id: "ingredients-prod-cfg",
+        summary: "prompt + a reference sheet on the dev transformer, CFG only — two forwards "
+            + "per step, half of 'ingredients-prod' for the same resolution",
+        command: "ingredients",
+        stages: [
+            RecipeStage(name: "reference-guided",
+                        sigmas: .continuous(steps: 30),
+                        sampler: .euler,
+                        videoGuidance: .cfgOnlyVideo,
+                        audioGuidance: .cfgOnlyAudio,
+                        transformer: .dev,
+                        adapters: [
+                            AdapterRequest(filenameHint: "ic-lora-ingredients", strength: 1.0)
+                        ]),
+        ],
+        requires: [.transformer, .textEncoder, .videoVAECausal, .audioVAE, .lora],
+        contextReferences: Recipe.ContextReferences(minimum: 1, maximum: 1, latentFramesEach: 1))
+
     /// A prompt plus **a cast** — up to five reference stills, each in its own slot, through
     /// the Multiple-Subject-Reference IC-LoRA. Runs through `MSRRenderer`.
     ///
@@ -528,6 +591,48 @@ public enum RecipeRegistry {
         // Each still is repeated onto 33 pixel frames and encodes to 5 latent frames. At
         // five slots that is 25 latent frames of reference against a target that may have
         // fewer — which is exactly why the menu prints it.
+        contextReferences: Recipe.ContextReferences(minimum: 1, maximum: 5, latentFramesEach: 5))
+
+    /// ``msr`` on the **dev** transformer with production guidance. Single stage, for the
+    /// reason ``ingredientsProd`` gives — and more so here, since a cast costs sequence
+    /// length that a half-resolution draft would spend on references rather than structure.
+    public static let msrProd = Recipe(
+        id: "msr-prod",
+        summary: "prompt + a cast of reference stills on the dev transformer, production "
+            + "guidance, one stage — four forwards per step",
+        command: "msr",
+        stages: [
+            RecipeStage(name: "reference-guided",
+                        sigmas: .continuous(steps: 30),
+                        sampler: .euler,
+                        videoGuidance: .productionVideo,
+                        audioGuidance: .productionAudio,
+                        transformer: .dev,
+                        adapters: [
+                            AdapterRequest(filenameHint: "licon-msr", strength: 1.0)
+                        ]),
+        ],
+        requires: [.transformer, .textEncoder, .videoVAECausal, .audioVAE, .lora],
+        contextReferences: Recipe.ContextReferences(minimum: 1, maximum: 5, latentFramesEach: 5))
+
+    /// ``msrProd`` with CFG alone — two forwards per step. See ``ingredientsProdCFG``.
+    public static let msrProdCFG = Recipe(
+        id: "msr-prod-cfg",
+        summary: "prompt + a cast of reference stills on the dev transformer, CFG only — "
+            + "two forwards per step, half of 'msr-prod' for the same resolution",
+        command: "msr",
+        stages: [
+            RecipeStage(name: "reference-guided",
+                        sigmas: .continuous(steps: 30),
+                        sampler: .euler,
+                        videoGuidance: .cfgOnlyVideo,
+                        audioGuidance: .cfgOnlyAudio,
+                        transformer: .dev,
+                        adapters: [
+                            AdapterRequest(filenameHint: "licon-msr", strength: 1.0)
+                        ]),
+        ],
+        requires: [.transformer, .textEncoder, .videoVAECausal, .audioVAE, .lora],
         contextReferences: Recipe.ContextReferences(minimum: 1, maximum: 5, latentFramesEach: 5))
 
     // MARK: Transform

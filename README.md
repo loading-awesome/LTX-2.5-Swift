@@ -213,6 +213,11 @@ ones, held clean and dropped before the decode. That costs real sequence length 
 five MSR slots at 640×384 add 6000 tokens against 3120 generated — so budget
 memory from the total rather than the output size. `ltx recipes` prints both.
 
+Both take `--width`/`--height` as the **output** and sample stage 1 at half it,
+then x2 upsample and refine — the same two-stage shape `ltx render` uses. Steps and
+resolution multiply, so running the long step count at the full size is the one
+arrangement worth avoiding. `--single-stage` opts out.
+
 ---
 
 ## All the commands
@@ -230,6 +235,10 @@ ltx bench         measure this machine
 `doctor` and `recipes` are the two worth running first. Between them they answer
 "what can this machine do" and "how do I ask for it" without starting a render to
 find out.
+
+**There is no `--steps`.** The step count belongs to the pipeline: `prod` is 30, `distilled`/`ingredients`/`msr` run the recorded 8-step draft table, and every `upscale` mode runs the recorded 3-step refine. Thinning the draft schedule drops a sigma out of the middle of its working range, which reads as background that never resolves rather than as a faster render.
+
+The stage-2 refine follows the same logic from the other end, and so its count follows the *curve* rather than the recipe's name. An unguided refine runs the recorded stage-2 table, which is four sigmas long — three steps is that schedule rather than a sample of it. A guided refine runs the continuous curve, which has no such length and whose last live sigma is pinned to `terminal` however many steps precede it; at three steps one jump covers 63% of the range it is descending, and a large dark region arrives as a coarse stipple instead of as fabric. Guided refines take 8.
 
 Useful `render` options:
 
@@ -373,8 +382,3 @@ what you distribute, and state that you changed the files you changed.
 The model weights are not in this repository and are licensed separately by
 Lightricks. `patches/mlx-m3-ultra-large-m-gemm.patch` is a change to
 [mlx-swift](https://github.com/ml-explore/mlx-swift), which is MIT licensed.
-
-> **If you verify the signature on a built binary**, `codesign -dv` reports
-> `Developer ID Application: Tesserapps, LLC`, which is not the name on the
-> copyright above. That is expected: the copyright is personal and Tesserapps is
-> the Apple developer account whose certificates sign the binaries.

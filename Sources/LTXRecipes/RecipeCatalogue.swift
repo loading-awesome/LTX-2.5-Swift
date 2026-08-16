@@ -112,13 +112,19 @@ public struct RecipeCatalogue: Sendable {
     ///
     /// Darwin's Foundation ignores width flags for `%@`, so `%-18@` does not pad and the
     /// table silently collapses into a ragged list.
+    ///
+    /// **Always at least one space**, even for a value that fills its column. Returning an
+    /// over-long value unpadded ran it straight into the next column —
+    /// `ingredients-prod-cfgltx ingredients` — which is the same ragged-list failure the
+    /// hand-rolled padding exists to avoid, reached by the other end. A column width is a
+    /// preference about alignment; a separator is not.
     private func pad(_ s: String, _ width: Int) -> String {
-        s.count >= width ? s : s + String(repeating: " ", count: width - s.count)
+        s + String(repeating: " ", count: max(1, width - s.count))
     }
 
     public var report: String {
         var out: [String] = []
-        out.append(pad("id", 18) + pad("run with", 16) + pad("shape", 12) + pad("stages", 8)
+        out.append(pad("id", 22) + pad("run with", 16) + pad("shape", 12) + pad("stages", 8)
                    + pad("tokens", 16) + "status")
 
         for row in rows {
@@ -132,7 +138,7 @@ public struct RecipeCatalogue: Sendable {
                 ? "-"
                 : row.videoTokens.map(String.init).joined(separator: " + ")
             let status = row.failure == nil ? (row.evidence?.label ?? "ok") : "REFUSED"
-            out.append(pad(row.id, 18) + pad("ltx " + row.command, 16) + pad(shape, 12)
+            out.append(pad(row.id, 22) + pad("ltx " + row.command, 16) + pad(shape, 12)
                        + pad(stages, 8) + pad(tokens, 16) + status)
             out.append("    " + row.summary)
             if let references = row.referenceTokens {

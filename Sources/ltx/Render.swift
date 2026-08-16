@@ -21,10 +21,6 @@ struct Render: AsyncParsableCommand {
     @Option(help: "Where to write the mp4. A .provenance.json is written beside it.")
     var out: String
 
-    @Option(help: ArgumentHelp("Sampler steps. Defaults to 30. REFUSED with "
-                + "--two-stage, whose two sigma schedules are fixed tables (8 then 3)."))
-    var steps: Int?
-
     @Option(help: ArgumentHelp("Video CFG scale. This is what makes --negative-prompt "
                 + "bite on the picture. 1.0 is neutral and disables it. Defaults to 3.0; "
                 + "refused with --two-stage, which builds no guider."))
@@ -270,7 +266,9 @@ struct Render: AsyncParsableCommand {
             seconds: Double(frames) / fps,
             frames: frames,
             frameRate: fps,
-            steps: steps,
+            // The recipe owns the schedule. `prod` is 30 steps, `distilled` is a
+            // pair of fixed tables; neither is a number a caller supplies.
+            steps: nil,
             seed: seed,
             megapixels: megapixels,
             aspectRatio: reqAspect,

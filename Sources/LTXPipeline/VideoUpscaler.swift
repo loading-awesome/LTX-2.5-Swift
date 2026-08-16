@@ -5,6 +5,7 @@ import Foundation
 import LTXCatalog
 import LTXFoundation
 import LTXModules
+import LTXRecipes
 import MLX
 
 /// x2 spatial upscale of a video that already exists.
@@ -240,6 +241,70 @@ public enum VideoUpscaler {
         let k = denoise / first
         return recorded.map { $0 * k }
     }
+
+    /// Which curve a reference-guided stage samples on.
+    ///
+    /// Extracted from ``referenceGuided(references:geometry:checkpoints:prompt:seed:steps:referenceStrength:initialVideo:explicitSigmas:guided:overlay:note:)``
+    /// so the precedence is checkable without a 22 B checkpoint in the room, because getting
+    /// it wrong is silent.
+    ///
+    /// **An explicit curve wins, guided or not.** The guided branch used to take priority,
+    /// and that combination — a guided stage 2 — had never been run. Stage 2 supplies its own
+    /// curve precisely because it starts partway down the trajectory: it continues stage 1
+    /// rather than beginning again. A schedule derived from a step count always starts at
+    /// 1.0, and the upsampled latent is lerped to `sigmas[0]` on the way in, so a 1.0 head
+    /// lerps it *entirely* to noise. The refine becomes a fresh render at full resolution,
+    /// at four forwards a step, with nothing left of the draft it was handed. It completes,
+    /// it looks like a render, and it is wrong.
+    static func schedule(explicit: [Float]?, guided: Guided?,
+                         requestedSteps: Int) throws -> [Float] {
+        if let explicit { return explicit }
+        // The dev transformer's own continuous schedule, not a thinning of a recorded
+        // table. `FlowSchedule` is what `prod` samples on and takes any step count.
+        if let guided { return try FlowSchedule().sigmas(steps: guided.steps) }
+        return Self.stage1Sigmas(steps: requestedSteps)
+    }
+
+    /// A stage-2 refine curve for the **dev** transformer, on its own continuous schedule.
+    ///
+    /// ``stage2Sigmas(denoise:)`` rescales the *recorded distilled* table, which is the
+    /// right curve only on the weights it was distilled onto. `prod` runs dev, and dev
+    /// samples on `FlowSchedule` — so this builds the continuous curve at the refine's own
+    /// step count and scales the whole of it to start at `denoise`, which is the same
+    /// operation ``stage2Sigmas(denoise:)`` performs on the recorded one: the shape is the
+    /// schedule's, the starting point is the re-noise level.
+    ///
+    /// `denoise` defaults to 0.909375, the distilled stage 2's own head, because that is
+    /// the level the whole two-stage arrangement is built around — stage 1 hands over a
+    /// draft and stage 2 re-noises to 91% and re-derives at full resolution. Nothing
+    /// anchors the pairing of that number with *this* curve; it is the recorded
+    /// arrangement's re-noise level applied to the schedule dev actually samples on.
+    ///
+    /// Not a thinning and not a tail. Taking the tail of a 30-step continuous curve below
+    /// 0.909 would be roughly 27 steps, which is not a refine; taking its last four sigmas
+    /// would start near 0.09 and barely move the picture.
+    public static func productionStage2Sigmas(
+        steps: Int,
+        denoise: Float = FlowSchedule.distilledStage2[0]) throws -> [Float] {
+        let curve = try FlowSchedule().sigmas(steps: steps)
+        guard let first = curve.first, first > 0 else { return curve }
+        let k = denoise / first
+        return curve.map { $0 * k }
+    }
+
+    /// How many steps a stage-2 refine takes, which depends on *which curve* it runs.
+    ///
+    /// Not a preference. The distilled stage-2 table is four sigmas long, so three steps is
+    /// that schedule itself rather than a sample of it. ``productionStage2Sigmas(steps:_:)``
+    /// has no such length, and `FlowSchedule`'s stretch pins its last live sigma to
+    /// `terminal` — so three steps of it is `0.909 -> 0.668 -> 0.091 -> 0`, one jump
+    /// covering four fifths of the range it is descending.
+    ///
+    /// Measured, on a fixed draft and seed: at three steps a black coat arrives as a coarse
+    /// stipple, and at eight as fabric. It is the same defect an over-thinned stage 1 has,
+    /// read from the other end — a sigma missing from the middle of the working range. The
+    /// eight costs 32 forwards against 12, beside stage 1's 120.
+    public static func refineSteps(guided: Bool) -> Int { guided ? 8 : 3 }
 
     /// The recorded stage-1 schedule, thinned to `steps`.
     ///
@@ -597,6 +662,55 @@ public enum VideoUpscaler {
     ///     holds more than LoRA factors — MSR's five slot tensors have to be lifted out
     ///     before ``LTXModules/LoRAOverlay`` sees the map, so that caller builds the overlay
     ///     itself and hands it over. Nil loads `checkpoints.icLoRA` whole, as before.
+    /// The production arrangement, for a reference-conditioned render that wants the dev
+    /// transformer's continuous schedule instead of the distilled tables.
+    ///
+    /// The distilled default is one forward per step on a nine-sigma table. This is four
+    /// forwards per step on a schedule of any length, which is what `prod` is — and the
+    /// reference tokens ride through it unchanged, held clean in **both** guidance
+    /// branches. That last part is the whole reason this is a type rather than a step
+    /// count: the conditional and unconditional passes must see the same reference, or
+    /// CFG subtracts a render that never saw the character from one that did, and the
+    /// conditioning quietly weakens instead of failing.
+    public struct Guided: Sendable {
+        public let negativePrompt: String
+        public let video: GuidanceParams
+        public let audio: GuidanceParams
+        public let steps: Int
+
+        /// The production arrangement, matching `RecipeRegistry.production`.
+        ///
+        /// Defined once, here, rather than in each command that offers it: these five
+        /// numbers are what `prod` *means*, and two commands carrying their own copies is
+        /// how one of them ends up a version behind.
+        public static func production(negativePrompt: String = "") -> Guided {
+            Guided(negativePrompt: negativePrompt,
+                   video: GuidanceParams(cfgScale: 3.0, stgScale: 1.0, stgBlocks: [28],
+                                         rescaleScale: 0.7, modalityScale: 3.0),
+                   audio: GuidanceParams(cfgScale: 7.0, stgScale: 1.0, stgBlocks: [28],
+                                         rescaleScale: 0.7, modalityScale: 3.0),
+                   steps: 30)
+        }
+
+        public init(negativePrompt: String = "", video: GuidanceParams,
+                    audio: GuidanceParams, steps: Int) {
+            self.negativePrompt = negativePrompt
+            self.video = video
+            self.audio = audio
+            self.steps = steps
+        }
+
+        /// The same guidance at a different step count, for a stage 2.
+        ///
+        /// The five guidance numbers carry across unchanged — they are what `prod` means and
+        /// stage 2 is still `prod`. Only the count differs, and it differs because stage 2 is
+        /// a refine: it re-derives the last stretch of the trajectory at full resolution
+        /// rather than walking the whole of it.
+        public func refining(steps: Int) -> Guided {
+            Guided(negativePrompt: negativePrompt, video: video, audio: audio, steps: steps)
+        }
+    }
+
     static func referenceGuided(references: [MLXArray],
                                         geometry: DiTForward.Geometry,
                                         checkpoints: Checkpoints,
@@ -606,7 +720,12 @@ public enum VideoUpscaler {
                                         referenceStrength: Float = 1.0,
                                         initialVideo: MLXArray? = nil,
                                         explicitSigmas: [Float]? = nil,
+                                        guided: Guided? = nil,
                                         overlay preloaded: LoRAOverlay? = nil,
+                                        sampler samplerKind: SamplerKind? = nil,
+                                        evalCadence: Int = 1,
+                                        cacheThreshold: Double = 0,
+                                        cacheMaxSkips: Int = StepCachePolicy.measuredCap,
                                         note: ((String) -> Void)?) throws
         -> (video: MLXArray, audio: MLXArray) {
         guard let ditURL = checkpoints.dit, let textURL = checkpoints.textEncoder,
@@ -649,13 +768,33 @@ public enum VideoUpscaler {
 
         note?("encoding the prompt")
         let text = try TextConditioningPipeline(textEncoder: textURL, dit: ditURL)
-        let encoding = try text.encode(prompt: prompt, branch: 0)
-        let conditioning = Pipeline.Conditioning(
-            video: try Renderer.require(encoding.features[.video], "features.video"),
-            audio: try Renderer.require(encoding.features[.audio], "features.audio"))
-        MLX.eval(conditioning.video, conditioning.audio)
-        let branches = Renderer.TextBranches(positive: conditioning, negative: conditioning,
+        let branches: Renderer.TextBranches
+        if let guided {
+            // A real second branch. The unguided path reuses the positive encoding for
+            // both, which is correct only while `cfgScale` is 1.0 and the unconditional
+            // pass is never consulted; under guidance that would subtract the prompt from
+            // itself and neutralise CFG while still paying for the pass.
+            let encoded = try text(prompt: prompt, negativePrompt: guided.negativePrompt)
+            func conditioning(_ e: TextConditioningPipeline.Encoding) throws
+                -> Pipeline.Conditioning {
+                Pipeline.Conditioning(
+                    video: try Renderer.require(e.features[.video], "features.video"),
+                    audio: try Renderer.require(e.features[.audio], "features.audio"))
+            }
+            let positive = try conditioning(encoded[0])
+            let negative = try conditioning(encoded[1])
+            MLX.eval(positive.video, positive.audio, negative.video, negative.audio)
+            branches = Renderer.TextBranches(positive: positive, negative: negative,
+                                             validTokenCounts: encoded.map(\.validTokenCount))
+        } else {
+            let encoding = try text.encode(prompt: prompt, branch: 0)
+            let conditioning = Pipeline.Conditioning(
+                video: try Renderer.require(encoding.features[.video], "features.video"),
+                audio: try Renderer.require(encoding.features[.audio], "features.audio"))
+            MLX.eval(conditioning.video, conditioning.audio)
+            branches = Renderer.TextBranches(positive: conditioning, negative: conditioning,
                                              validTokenCounts: [encoding.validTokenCount])
+        }
         MLX.Memory.clearCache()
 
         let header = try SafetensorsHeader.read(from: ditURL)
@@ -673,19 +812,47 @@ public enum VideoUpscaler {
         var forward = DiTForward(weights: weights, topology: topology, attentionPath: .fused)
         forward.attach(lora: overlay)
         let head = DiTOutputHead(weights: weights, topology: topology)
+        // One cache per guidance pass, never one shared across them: a conditional residual
+        // and an unconditional one are not comparable, and a shared cache would reuse across
+        // that gap. Threshold 0 means the dense loop, which is the default and what every
+        // measurement in this repo was taken with.
+        // Built for every pass rather than for the planned ones: the plan needs a `Sampler`
+        // that does not exist yet at this point, and a cache for a pass that never runs is
+        // never queried. Cheap, and it cannot go stale against a guidance change.
+        var stepCaches: [Sampler.Pass: StepCache] = [:]
+        let plannedSteps = explicitSigmas.map { $0.count - 1 } ?? requestedSteps
+        if cacheThreshold > 0 {
+            for pass in Sampler.Pass.allCases {
+                stepCaches[pass] = StepCache(pass: pass.description,
+                                             threshold: cacheThreshold,
+                                             maxConsecutiveSkips: cacheMaxSkips)
+            }
+            note?("step cache: threshold \(cacheThreshold), cap \(cacheMaxSkips) — a step "
+                  + "whose block-0 residual moved less than the threshold reuses the previous")
+        }
         let denoiser = Pipeline.DiTDenoiser(forward: forward, head: head, geometry: geometry,
                                             positive: branches.positive,
                                             negative: branches.negative,
-                                            videoSTGBlocks: [], audioSTGBlocks: [])
+                                            videoSTGBlocks: guided?.video.stgBlocks ?? [],
+                                            audioSTGBlocks: guided?.audio.stgBlocks ?? [],
+                                            stepCaches: stepCaches,
+                                            cacheStepCount: stepCaches.isEmpty ? 0 : plannedSteps)
 
         // Stage 2 supplies its own schedule and its own starting point. Everything else —
         // the adapter, the appended reference, the clean mask — stays, which is the whole
         // difference between this and `refine`.
-        let sigmas = explicitSigmas ?? Self.stage1Sigmas(steps: requestedSteps)
+        let sigmas = try Self.schedule(explicit: explicitSigmas, guided: guided,
+                                       requestedSteps: requestedSteps)
         let steps = sigmas.count - 1
         note?("schedule: \(steps) steps, sigmas \(sigmas)")
-        let sampler = Sampler(video: DistilledRenderer.neutralGuidance,
-                              audio: DistilledRenderer.neutralGuidance)
+        let sampler = Sampler(video: guided?.video ?? DistilledRenderer.neutralGuidance,
+                              audio: guided?.audio ?? DistilledRenderer.neutralGuidance)
+        if let guided {
+            note?("guidance: cfg \(guided.video.cfgScale)/\(guided.audio.cfgScale), "
+                + "stg \(guided.video.stgScale) on \(guided.video.stgBlocks), "
+                + "modality \(guided.video.modalityScale) -> "
+                + "\(sampler.passCount(steps: steps)) forwards for the render")
+        }
         // `RenderNoise` sizes itself from `videoTokens`, which stays the *generated* count,
         // so the draw is the same one an unconditioned render of this shape would make.
         let drawn = try RenderNoise(seed: seed, geometry: geometry).streamsForRenderOnly()
@@ -732,10 +899,15 @@ public enum VideoUpscaler {
             steps: steps, initial: seeded, denoiser: denoiser,
             denoiseMask: denoiseMask, cleanLatent: cleanLatent,
             explicitSigmas: sigmas,
-            stepper: .ancestral(eta: DistilledRenderer.ancestralEta,
-                                sNoise: DistilledRenderer.ancestralSNoise,
-                                seed: seed &+ DistilledRenderer.ancestralNoiseSeedOffset),
-            retainHistory: false,
+            // The recipe's declared sampler when it named one, else the historical default:
+            // ancestral for the distilled path, deterministic Euler for a guided one.
+            stepper: (samplerKind?.isAncestral ?? (guided == nil))
+                ? .ancestral(eta: DistilledRenderer.ancestralEta,
+                             sNoise: DistilledRenderer.ancestralSNoise,
+                             seed: seed &+ DistilledRenderer.ancestralNoiseSeedOffset)
+                : .euler,
+            retainHistory: false, evalCadence: evalCadence,
+            cfgPP: (samplerKind?.usesCFGPP ?? false) ? 1 : 0,
             observer: { step, _ in note?("  step \(step + 1)/\(steps)") })
 
         // Drop the reference. It was never picture — decoding it would append the input

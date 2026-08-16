@@ -86,7 +86,7 @@ Every generating command shares one geometry model.
 |---|---|
 | width, height | multiples of **64** |
 | frames | on the **8k+1** lattice — 1, 9, 17 … 97, 105 … |
-| size | `--width`/`--height`, or `--megapixels` with `--aspect-ratio` |
+| size | `--megapixels` with `--aspect-ratio`, or the recipe's own measured shape. `render` also takes `--width`/`--height`; `ingredients` and `msr` do not — their stage shapes come from the recipe |
 | aspect ratios | `16:9`, `9:16`, `1:1`, `21:9`, `4:3`, `3:4` |
 
 The frame lattice is the causal VAE's: frame 0 encodes alone and every 8 frames
@@ -170,11 +170,26 @@ parameter, the checkpoint identities, and how the latent was drawn.
 
 ### Choosing the pipeline
 
-`--recipe` decides the stages, the schedule, the sampler, the guidance and the
-transformer. `--steps` and the guidance flags are **overrides on top of it**, and a
-recipe whose schedule is a literal table refuses them by name rather than ignoring
-them. `--recipe distilled` is the spelling to prefer over the older `--two-stage`
-flag, which means the same thing.
+`--recipe` decides the stages, **the step count**, the sampler, the guidance and
+the transformer. The guidance flags are overrides on top of it, and a recipe that
+builds no guider refuses them by name rather than ignoring them. `--recipe
+distilled` is the spelling to prefer over the older `--two-stage` flag, which means
+the same thing.
+
+**There is no `--steps`.** A step count is a property of the schedule a pipeline
+was distilled or measured for, not a dial:
+
+| job | steps | why that number |
+|---|---|---|
+| `prod` | **30** | the measured single-stage schedule |
+| `distilled`, `ingredients`, `msr` | **8** | the recorded draft table, returned bit-identically at 8 |
+| the refine and every `upscale` mode | **3** | the recorded stage-2 table, which is literally four sigmas long |
+
+Below 8 the draft schedule is *thinned*, and it thins from the head — the first
+five of its sigmas span 1.0 to 0.975 while the last four do the work. So a lower
+count is not the same trajectory rendered faster; it is a different one with
+`0.725` missing from the middle of the working range, which shows up as background
+structure that never resolves.
 
 ### Guidance, and where neutral is
 
@@ -249,14 +264,53 @@ objects and locations a shot should contain — through the Ingredients IC-LoRA.
 
 ```bash
 ltx ingredients --reference sheet.png --prompt "…" --out shot.mp4
-ltx ingredients -r sheet.png -p "…" --upsample --width 768 --height 448
+ltx ingredients -r sheet.png -p "…" --recipe ingredients-prod-cfg --megapixels 0.25
 ```
 
-The sheet is encoded at the **output's** resolution and its latent tokens ride
-alongside the generated ones, held clean, then dropped before the decode. Runs on
-the distilled transformer at the distilled 3-step schedule. `--upsample` adds the
-second stage — x2 latent upsample then refine — so the file written is twice
-`--width` × `--height`.
+The sheet is encoded at each **stage's** resolution and its latent tokens ride
+alongside the generated ones, held clean, then dropped before the decode.
+
+**There is no `--width` or `--height`.** The output comes from `--megapixels` and
+`--aspect-ratio` through the shape ladder, or from the recipe's own measured shape
+when you name neither. What each **stage** samples at comes from that stage's
+`scale`, so it is a property of the recipe rather than of your command line.
+
+That is not tidiness. Draft resolution is the knob that decides whether rigid
+structure survives: a subject occupying a 10×6 latent grid has nowhere to put
+mechanical detail, and a refine that re-noises to 0.909 then invents it
+independently per frame — which is what melting is. These flags briefly meant the
+*output* size with stage 1 sampling at half, and the release that changed them
+halved every existing caller's draft without their command line changing.
+
+Three recipes run here. `ltx recipes` prints them with the shape each resolves to
+and what it has been measured at.
+
+| recipe | transformer | schedule | guidance | stages | forwards |
+|---|---|---|---|---|---|
+| `ingredients` | distilled | 8-step table + 3-step refine | none | 2 | **11** |
+| `ingredients-prod` | dev | continuous, 30 | production | 1 | **120** |
+| `ingredients-prod-cfg` | dev | continuous, 30 | CFG only | 1 | **60** |
+
+**Two stages is not a speed setting.** It makes a *larger* output cheaper than
+rendering it natively — measured at 1.95× — and it does not make a given output
+faster, because the draft it economises on is the draft the picture is built from.
+Comparing two-stage at 640×384 against single-stage at 640×384 compares a 320×192
+draft against a 640×384 one. The prod recipes are single-stage at full resolution
+for that reason and buy their time back on passes instead: `-cfg` drops STG and the
+modality term, which are two of the four passes, for half the wall clock at the same
+resolution. CFG is the structural term; the other two refine what it has placed.
+
+`ingredients` still drafts and refines, because its distilled schedule is cheap
+enough that the refine is most of its cost anyway. Its stage 2 starts at the
+recorded 0.909375 re-noise level, so it continues stage 1 rather than re-rendering
+it — the curve is scaled to that head rather than truncated, which keeps its shape.
+
+Two machine knobs, neither of which changes what is rendered:
+`--eval-cadence n` forces the latent every n-th step instead of every step, trading
+a larger live working set for fewer GPU barriers; `--cache-threshold` reuses the
+previous step's residual when block 0's has barely moved. Both default to the dense
+behaviour every measurement in this repo was taken with. See `docs/PERFORMANCE.md`
+for what each was measured at.
 
 The shipped adapter is a 2.3 checkpoint. All 480 of its modules resolve against the
 2.5 transformer with matching shapes, which is a statement about key sets and not
@@ -287,6 +341,13 @@ repeated to before encoding. This is the cost dial: five references at 33 frames
 occupy five times what a 33-frame clip would. `ltx recipes` prints the in-context
 token cost beside the generated one — budget memory from the total.
 
+`--width` and `--height` are the **output** here too, and stage 1 samples at half
+both. One difference from `ltx ingredients`: stage 2 re-prepares, re-encodes and
+re-tags the **whole cast** at the output resolution, because
+`reference_downscale_factor` is 1 and a reference must sit on its own stage's grid
+— so a five-slot render pays five encodes twice. Seconds, against the minutes of
+steps it saves. `--single-stage` opts out.
+
 ## `ltx upscale`
 
 Enlarges a clip that already exists. Both axes of the input must be multiples of
@@ -312,9 +373,9 @@ re-derives, it re-derives toward that prompt, and an empty one points at the bas
 model's own prior, which for this checkpoint is photographic. Pass the film's style
 string, or `--prompt-file` to keep it byte-identical across runs.
 
-For `ic-lora`, `--steps` defaults to 3 — **fewer steps keep the output closer to
-the reference**, which is the model card's own fidelity dial. The full recorded
-schedule is 8.
+Every mode runs the recorded 3-step refine table. That is the schedule rather than
+a sample of it, and it is the difference between cleaning up a draft and
+re-rendering a finished clip — a decision `--mode` has already made.
 
 `--ic-lora` is not `--upsampler`. The upsampler is the latent spatial upscaler that
 sits between the two stages of a distilled render; the IC-LoRA is a rank-32 adapter

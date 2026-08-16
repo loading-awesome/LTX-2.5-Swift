@@ -6,6 +6,7 @@ import Foundation
 import LTXCatalog
 import LTXFoundation
 import LTXPipeline
+import LTXRecipes
 
 /// `ltx msr` — render a shot with a cast of references, each held apart.
 ///
@@ -32,10 +33,26 @@ struct MSR: AsyncParsableCommand {
             it takes the last slot and is centre-cropped to the frame, where a subject is \
             padded rather than cropped when its aspect ratio disagrees with the output's.
 
-            Each still is repeated to --reference-frames frames and encoded at the OUTPUT's \
+            Each still is repeated to --reference-frames frames and encoded at the STAGE's \
             resolution, so the cast costs real sequence length: five references at 33 frames \
-            occupy five times what a 33-frame clip would. Runs on the DISTILLED transformer \
-            at the distilled schedule.
+            occupy five times what a 33-frame clip would.
+
+            THERE IS NO --width OR --height. The output comes from --megapixels and \
+            --aspect-ratio through the shape ladder, or from the recipe's own measured shape \
+            when you name neither, and what each STAGE samples at comes from that stage's \
+            scale. Draft resolution decides whether rigid structure survives, so it is a \
+            recipe's decision rather than a flag's.
+
+            Three recipes run here; `ltx recipes` prints them. 'msr' is the adapter's own \
+            arrangement — the distilled transformer on its 8-step table, no guidance, one \
+            forward per step. 'msr-prod' is the dev transformer on a continuous 30-step \
+            schedule with production guidance, four forwards per step. 'msr-prod-cfg' is that \
+            with CFG alone: two forwards per step, half the wall clock, same resolution.
+
+            All three are single stage. A refine would re-prepare, re-encode and re-tag every \
+            slot at the output resolution — reference_downscale_factor is 1, so a reference \
+            must sit on its own stage's grid, and a five-slot cast would pay five encodes \
+            twice for a draft that had less structure in it to begin with.
             """)
 
     static let hint = "licon-msr"
@@ -55,11 +72,13 @@ struct MSR: AsyncParsableCommand {
     @Option(name: .shortAndLong, help: "Output .mp4.")
     var out: String = "msr.mp4"
 
-    @Option(help: "Width in pixels; a multiple of 64.")
-    var width: Int = 640
+    @Option(help: ArgumentHelp("Megapixel target, resolved against --aspect-ratio through "
+                + "the shape ladder. Omitted takes the recipe's own measured shape."))
+    var megapixels: Double?
 
-    @Option(help: "Height in pixels; a multiple of 64.")
-    var height: Int = 384
+    @Option(help: ArgumentHelp("Aspect ratio: "
+                + AspectRatio.allCases.map(\.rawValue).joined(separator: ", ") + "."))
+    var aspectRatio: String = "16:9"
 
     @Option(help: "Frame count; must satisfy frames % 8 == 1.")
     var frames: Int = 49
@@ -67,8 +86,12 @@ struct MSR: AsyncParsableCommand {
     @Option(help: "Frame rate.")
     var fps: Double = 24
 
-    @Option(help: "Sampler steps. 3 is the distilled schedule's own count.")
-    var steps: Int = 3
+
+    @Option(help: ArgumentHelp("Which registered recipe to run. Every shape, schedule and "
+                + "guidance setting comes from it — see `ltx recipes` for the menu."))
+    var recipe: String = RecipeRegistry.msr.id
+
+
 
     @Option(help: "Seed.")
     var seed: UInt64 = 42
@@ -85,7 +108,8 @@ struct MSR: AsyncParsableCommand {
                 + "'\(MSR.hint)' against the adapter roots."))
     var icLora: String?
 
-    @Option(help: "OVERRIDE the DiT. Defaults to the distilled transformer.")
+    @Option(help: ArgumentHelp("OVERRIDE the DiT. Defaults to the transformer the recipe's "
+                + "stages declare — dev or distilled."))
     var checkpoint: String?
 
     @Option(help: "OVERRIDE the text encoder.")
@@ -94,8 +118,7 @@ struct MSR: AsyncParsableCommand {
     @Option(help: "OVERRIDE the video VAE.")
     var videoVae: String?
 
-    @Option(help: ArgumentHelp("OVERRIDE the latent spatial upsampler. Unused by this "
-                + "command; the checkpoint bundle requires it."))
+    @Option(help: "OVERRIDE the x2 latent spatial upsampler, which stage 2 runs.")
     var upsampler: String?
 
     @Option(help: "OVERRIDE the audio VAE. Every render carries sound, so this is always read.")
@@ -113,7 +136,31 @@ struct MSR: AsyncParsableCommand {
         }
 
         var paths = try Paths(configPath: config)
-        let ditURL = try paths.url(.ditDistilled, override: checkpoint)
+        guard let reqAspect = AspectRatio(rawValue: aspectRatio) else {
+            throw ValidationError("--aspect-ratio must be one of "
+                + AspectRatio.allCases.map(\.rawValue).joined(separator: ", "))
+        }
+        let chosen: Recipe
+        do {
+            chosen = try RecipeRegistry.recipe(recipe)
+        } catch {
+            throw ValidationError("\(error). Recipes for this command: "
+                + RecipeRegistry.all.filter { $0.command == "msr" }
+                    .map(\.id).joined(separator: ", "))
+        }
+        guard chosen.command == "msr" else {
+            throw ValidationError("recipe '\(recipe)' runs through `ltx \(chosen.command)`")
+        }
+        // Every shape decided before a checkpoint is opened, from the stages' own scales.
+        let plan = try chosen.resolve(RecipeRequest(
+            prompt: prompt, videoOutput: URL(fileURLWithPath: out),
+            seconds: Double(frames) / fps, frames: frames, frameRate: fps,
+            seed: seed, megapixels: megapixels, aspectRatio: reqAspect))
+
+        // The transformer follows the recipe's declared role. A 30-step continuous schedule
+        // on weights distilled to need eight renders, and is wrong.
+        let isDev = plan.stages.contains { $0.stage.transformer == .dev }
+        let ditURL = try paths.url(isDev ? .ditDev : .ditDistilled, override: checkpoint)
 
         let adapterURL: URL
         if let icLora {
@@ -134,7 +181,7 @@ struct MSR: AsyncParsableCommand {
 
         try Preflight.check(paths: paths, slots: [
             CheckpointInventory.Slot(role: "dit", url: ditURL, expected: .transformer,
-                                     nameMustContain: "distilled"),
+                                     nameMustContain: isDev ? "dev" : "distilled"),
             CheckpointInventory.Slot(role: "text encoder", url: checkpoints.textEncoder!,
                                      expected: .textEncoder),
             CheckpointInventory.Slot(role: "video vae", url: checkpoints.videoVAE,
@@ -147,14 +194,17 @@ struct MSR: AsyncParsableCommand {
         print("adapter  \(identity.name)")
         print("         v\(identity.modelVersion ?? "?")  \(identity.tensorCount) tensors")
 
+        print("recipe   \(plan.recipeID)  \(plan.output.description), "
+              + "\(plan.stages.count) stage(s), \(plan.forwardCount()) forwards")
+        print("         \(plan.evidence.label)")
+
         let report = try MSRRenderer.render(
             MSRRenderer.Options(
                 references: reference.map { URL(fileURLWithPath: $0) },
                 background: background.map { URL(fileURLWithPath: $0) },
                 prompt: prompt,
                 output: URL(fileURLWithPath: out),
-                width: width, height: height, frames: frames, frameRate: fps,
-                steps: steps, seed: seed, strength: strength,
+                plan: plan, seed: seed, strength: strength,
                 referenceFrames: referenceFrames),
             checkpoints: checkpoints,
             note: { FileHandle.standardError.write(Data("  \($0)\n".utf8)) })
@@ -163,15 +213,18 @@ struct MSR: AsyncParsableCommand {
             slots      %d, offsets %@ frames
             reference  %@ each -> %d tokens total
             generated  %d tokens
+            output     %dx%d, %d frames
             encode     %.1f s
-            sample     %.1f s
+            stage 1    %.1f s
+            stage 2    %.1f s
             decode     %.1f s
             peak       %.1f GB
-            wrote      %@ (%d frames)
+            wrote      %@
             """,
             report.slots, "\(report.frameOffsets)",
             "\(report.referenceLatentShape)", report.referenceTokens,
-            report.generatedTokens, report.encodeSeconds, report.sampleSeconds,
-            report.decodeSeconds, report.peakGB, out, report.framesWritten))
+            report.generatedTokens, report.outputWidth, report.outputHeight,
+            report.framesWritten, report.encodeSeconds, report.sampleSeconds,
+            report.refineSeconds, report.decodeSeconds, report.peakGB, out))
     }
 }

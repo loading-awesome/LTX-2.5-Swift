@@ -91,13 +91,11 @@ struct Upscale: AsyncParsableCommand {
                 + "tree, which only considers files whose own keys carry LoRA tensors."))
     var icLora: String?
 
-    @Option(help: ArgumentHelp("Sampler steps for --mode ic-lora. 3 is the recommended "
-                + "setting for upscaling and the default; the full recorded schedule is 8. Fewer steps keep the output CLOSER to the "
-                + "reference (the model card's own fidelity dial, alongside guidance, which "
-                + "this pipeline pins at neutral). Thinning comes out of the schedule's "
-                + "near-stationary head, so the working sigmas 0.909/0.725/0.422/0 survive "
-                + "down to 3 steps, where the schedule is [1.0, 0.909, 0.422, 0.0]."))
-    var steps: Int = 3
+
+    /// The recorded refine count, for both `refined` and `ic-lora`. Locked: a
+    /// step count here is the difference between cleaning a draft and re-rendering
+    /// a finished clip, which is a decision the mode already made.
+    static let refineSteps = 3
 
     @Option(help: ArgumentHelp("Seed for --mode ic-lora, which renders from noise rather "
                 + "than resampling. Change it for a different take of the same upscale."))
@@ -191,7 +189,7 @@ struct Upscale: AsyncParsableCommand {
             prompt: text,
             denoise: Float(denoise),
             seed: seed,
-            steps: steps,
+            steps: Self.refineSteps,
             keepAudio: !silent,
             fps: fps,
             maxFrames: maxFrames,

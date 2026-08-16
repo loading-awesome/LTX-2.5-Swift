@@ -48,3 +48,6 @@ out/
 # which are large and are derived from the clips plus the checkpoints.
 cache/
 *.ltx-cache/
+
+# Editor workspace settings, not part of the port.
+.vscode/

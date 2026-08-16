@@ -8,6 +8,7 @@ import LTXFoundation
 import LTXModules
 import MLX
 import Testing
+import LTXRecipes
 import UniformTypeIdentifiers
 @testable import LTXPipeline
 
@@ -132,11 +133,11 @@ struct MSRRendererTests {
     /// The background takes the **last** slot, and the offsets run pic1-furthest-back.
     @Test("slot order puts the background last and pic1 at the deepest offset")
     func slotOrder() throws {
-        let options = MSRRenderer.Options(
+        let options = try MSRRenderer.Options(
             references: [URL(fileURLWithPath: "/a.png"), URL(fileURLWithPath: "/b.png")],
             background: URL(fileURLWithPath: "/bg.png"),
             prompt: "", output: URL(fileURLWithPath: "/out.mp4"),
-            width: 640, height: 384, frames: 49)
+            plan: try RecipePlan.msr())
         let slots = options.slots
         #expect(slots.count == 3)
         #expect(slots.map(\.isBackground) == [false, false, true])
@@ -153,11 +154,11 @@ struct MSRRendererTests {
         let checkpoints = VideoUpscaler.Checkpoints(
             videoVAE: URL(fileURLWithPath: "/nope/vae.safetensors"),
             upsampler: URL(fileURLWithPath: "/nope/up.safetensors"))
-        func options(_ count: Int) -> MSRRenderer.Options {
-            MSRRenderer.Options(
+        func options(_ count: Int) throws -> MSRRenderer.Options {
+            try MSRRenderer.Options(
                 references: (0 ..< count).map { URL(fileURLWithPath: "/r\($0).png") },
                 prompt: "", output: URL(fileURLWithPath: "/out.mp4"),
-                width: 640, height: 384, frames: 49)
+                plan: try RecipePlan.msr())
         }
         #expect(throws: MSRRenderer.Failure.self) {
             try MSRRenderer.render(options(0), checkpoints: checkpoints)

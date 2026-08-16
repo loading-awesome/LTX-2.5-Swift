@@ -258,6 +258,23 @@ public struct RecipeGuidance: Sendable, Equatable {
 
     /// The distilled pipeline builds no guider at all: CFG 1, nothing else engaged.
     public static let distilled = RecipeGuidance(cfgScale: 1.0)
+
+    /// Production CFG with **nothing else engaged** — two forwards per step, not four.
+    ///
+    /// The pass count is the cost, and it is set by which terms are live: a step runs
+    /// `conditional`, adds `unconditional` when CFG is not 1, adds `perturbed` when STG is
+    /// not 0, and adds `modality` when the modality scale is not 1. Zeroing STG and
+    /// returning modality to 1 removes two of the four.
+    ///
+    /// Worth having as its own named pair rather than as a flag because the halving is the
+    /// whole reason to run it, and a name records what was run. CFG is the structural term —
+    /// it is what makes the render follow the prompt — while STG and modality refine what
+    /// CFG already placed. So this is the setting that buys back time without touching
+    /// stage resolution, which is the knob that decides whether rigid structure survives.
+    public static let cfgOnlyVideo = RecipeGuidance(cfgScale: 3.0)
+
+    /// ``cfgOnlyVideo``'s audio half. Dual CFG is two independent scales (contract 7).
+    public static let cfgOnlyAudio = RecipeGuidance(cfgScale: 7.0)
 }
 
 /// How a stage gets its sigmas.
@@ -288,6 +305,30 @@ public enum SamplerKind: String, Sendable {
     case euler
     /// Ancestral Euler at `eta = 1.0`, `s_noise = 1.0`. **Not ported.**
     case eulerAncestral
+    /// `euler_cfg_pp` — deterministic Euler taking its step *direction* from the
+    /// unconditional prediction while keeping the guided one as the destination.
+    ///
+    /// The guided x0 is an extrapolation away from the unconditional x0, and at a high CFG
+    /// scale the plain step inherits the whole of that extrapolation as its direction.
+    /// Keeping the destination and dropping the over-shoot is what CFG++ does, and the
+    /// artifact it removes — the crushed, over-saturated look at high guidance — is what
+    /// "CFG burn" names.
+    ///
+    /// Costs **nothing**: the unconditional prediction is already computed for CFG itself.
+    case eulerCFGPP
+    /// `euler_ancestral_cfg_pp` — the above with the ancestral renoise, which is the
+    /// sampler the shipped Ingredients workflow actually names.
+    case eulerAncestralCFGPP
+
+    /// Whether this sampler takes its direction from the unconditional prediction.
+    public var usesCFGPP: Bool {
+        self == .eulerCFGPP || self == .eulerAncestralCFGPP
+    }
+
+    /// Whether this sampler renoises after the deterministic half.
+    public var isAncestral: Bool {
+        self == .eulerAncestral || self == .eulerAncestralCFGPP
+    }
 }
 
 public enum TransformerRole: String, Sendable {

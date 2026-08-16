@@ -380,8 +380,11 @@ public struct Sampler: Sendable {
     /// Computed in fp32 and cast back to the sample's dtype.
     public func ancestralStep(sample: MLXArray, denoised: MLXArray, sigmas: [Float],
                               index: Int, noise: MLXArray?,
-                              eta: Float = 1.0, sNoise: Float = 1.0) throws -> MLXArray {
+                              eta: Float = 1.0, sNoise: Float = 1.0,
+                              directionDenoised: MLXArray? = nil) throws -> MLXArray {
         let sigma = sigmas[index], sigmaNext = sigmas[index + 1]
+        // The terminal short-circuit precedes CFG++ deliberately: at `sigmaNext == 0` the
+        // step *is* the prediction, and the destination is the guided one either way.
         if sigmaNext == 0 { return denoised.asType(sample.dtype) }
         guard sigma != 0 else { throw Failure.zeroSigma(step: index) }
         guard eta <= 0 || noise != nil else { throw Failure.missingAncestralNoise(step: index) }
@@ -392,7 +395,17 @@ public struct Sampler: Sendable {
         let downstepRatio = 1.0 + (sigmaNext / sigma - 1.0) * eta
         let sigmaDown = sigmaNext * downstepRatio
         let sigmaDownRatio = sigmaDown / sigma
-        var next = sigmaDownRatio * x + (1.0 - sigmaDownRatio) * x0
+        // `euler_ancestral_cfg_pp`: the deterministic half takes its direction from the
+        // unconditional prediction, exactly as in ``eulerStep(sample:denoised:sigmas:index:directionDenoised:)``,
+        // and the renoise below is untouched. Kept as a separate expression from the
+        // standard one so the standard path stays bit-identical.
+        // Same substitution as ``cfgPPStep(sample:denoised:direction:sigma:sigmaTarget:)``,
+        // targeting `sigmaDown` — the deterministic half of the ancestral step. The renoise
+        // below is untouched.
+        var next = directionDenoised.map {
+            Self.cfgPPStep(sample: sample, denoised: denoised, direction: $0,
+                           sigma: sigma, sigmaTarget: sigmaDown).asType(.float32)
+        } ?? (sigmaDownRatio * x + (1.0 - sigmaDownRatio) * x0)
 
         if eta > 0, let noise {
             let alphaNext = 1.0 - sigmaNext
@@ -421,10 +434,64 @@ public struct Sampler: Sendable {
     /// to ``ancestralStep(sample:denoised:sigmas:index:noise:eta:sNoise:)``, and this
     /// schedule's last step relies on the plain formula collapsing to the denoised
     /// prediction exactly — `SamplerLoopTests.terminalSigmaCollapses` pins that.
+    /// One CFG++ step: the guided prediction as destination, the unconditional one as the
+    /// **noise estimate**, in this schedule's own parameterisation.
+    ///
+    /// ## Why this is not k-diffusion's formula
+    ///
+    /// `euler_cfg_pp` is written `x = denoised + d·sigma_next` for `d = (x - x0_uncond)/sigma`.
+    /// That is correct under the **variance-exploding** convention `x = x0 + sigma·eps`,
+    /// where a step's x0 coefficient is 1 and swapping which prediction supplies `d` changes
+    /// only the noise term.
+    ///
+    /// This schedule is **rectified flow**: `x = (1 - sigma)·x0 + sigma·eps`. Its ordinary
+    /// step carries an x0 coefficient of `1 - sigma_next/sigma` — about **0.005** on the
+    /// first step of a 30-step run — because the `-sigma_next·x0/sigma` inside the velocity
+    /// cancels almost all of the leading `x0`. Take the direction from a *different*
+    /// prediction and that cancellation stops happening, leaving x0 at coefficient 1: a
+    /// ~200x amplification of the roughest prediction in the whole trajectory, applied at
+    /// every step. Transcribed literally, it renders uniform mush — measured, at guidance
+    /// scales 3.0 and 1.5 alike, which is what ruled out a scale mismatch as the cause.
+    ///
+    /// So the swap happens where it belongs. Recover the unconditional noise estimate,
+    /// `eps_u = (x - (1 - sigma)·x0_u) / sigma`, and step to the target with the schedule's
+    /// own coefficients: `(1 - sigma_target)·x0_guided + sigma_target·eps_u`. When the two
+    /// predictions agree this reduces exactly to the ordinary step, which is the property
+    /// that makes it a correction rather than a different sampler.
+    static func cfgPPStep(sample: MLXArray, denoised: MLXArray, direction: MLXArray,
+                          sigma: Float, sigmaTarget: Float) -> MLXArray {
+        let x = sample.asType(.float32)
+        let guided = denoised.asType(.float32)
+        let uncond = direction.asType(.float32)
+        let eps = (x - (1.0 - sigma) * uncond) / sigma
+        return ((1.0 - sigmaTarget) * guided + sigmaTarget * eps).asType(sample.dtype)
+    }
+
     public func eulerStep(sample: MLXArray, denoised: MLXArray, sigmas: [Float],
-                          index: Int) throws -> MLXArray {
+                          index: Int,
+                          directionDenoised: MLXArray? = nil) throws -> MLXArray {
         let sigma = sigmas[index], sigmaNext = sigmas[index + 1]
         guard sigma != 0 else { throw Failure.zeroSigma(step: index) }
+
+        // CFG++ takes the *direction* from a different prediction than the destination.
+        //
+        // The plain step is `x0 + r(sample - x0)` for `r = sigmaNext / sigma`, written
+        // below as `sample + v·dt` — the same thing, and the spelling is load-bearing for
+        // bit-exactness, so this is a separate branch rather than a generalisation of it.
+        // CFG++ keeps the guided `denoised` as the destination and takes the direction from
+        // the **unconditional** prediction: `x0_guided + r(sample - x0_uncond)`.
+        //
+        // What that buys: the guided x0 is a extrapolation away from the unconditional one,
+        // and at a high CFG scale the step direction inherits the whole of that
+        // extrapolation. Stepping along the unconditional direction while still landing on
+        // the guided prediction keeps the target and drops the over-shoot, which is what
+        // "CFG burn" — the crushed, over-saturated look at high guidance — actually is.
+        if let directionDenoised {
+            return Self.cfgPPStep(sample: sample, denoised: denoised,
+                                  direction: directionDenoised,
+                                  sigma: sigma, sigmaTarget: sigmaNext)
+        }
+
         let dt = sigmaNext - sigma
         var velocity = (sample.asType(.float32) - denoised.asType(.float32)) / sigma
         velocity = velocity.asType(sample.dtype)
@@ -498,7 +565,8 @@ public struct Sampler: Sendable {
                      enabled: (video: Bool, audio: Bool) = (true, true),
                      lastDenoised: Streams? = nil,
                      stepper: Stepper = .euler,
-                     stepNoise: Streams? = nil) throws -> StepResult {
+                     stepNoise: Streams? = nil,
+                     cfgPP: Float = 0) throws -> StepResult {
         let sigma = sigmas[index]
         let videoParams = video.effective(atSigma: sigma)
         let audioParams = audio.effective(atSigma: sigma)
@@ -513,6 +581,11 @@ public struct Sampler: Sendable {
                      _ noise: MLXArray?) throws
             -> (next: MLXArray, denoised: MLXArray) {
             let combined: MLXArray
+            // The unconditional x0, kept for CFG++. Only ever non-nil when a `.unconditional`
+            // pass actually ran, which is exactly when `cfgScale != 1` — so a recipe with
+            // guidance off cannot reach the CFG++ branch, and there is nothing sensible for
+            // it to mean there anyway.
+            var uncondX0: MLXArray?
             if isEnabled {
                 let timesteps = Self.timesteps(sigma: x0Sigma, mask: mask,
                                                tokens: latent.dim(1))
@@ -521,6 +594,7 @@ public struct Sampler: Sendable {
                     predictions[pass] = Self.denoised(latent: latent, velocity: velocity,
                                                       timesteps: timesteps)
                 }
+                uncondX0 = predictions[.unconditional]
                 combined = try combine(predictions, params: params, stream: stream)
             } else {
                 // There is no previous prediction until a step has run, and step 0 is
@@ -533,14 +607,32 @@ public struct Sampler: Sendable {
             }
             let processed = Self.postProcess(denoised: combined, denoiseMask: mask,
                                              cleanLatent: clean)
+            // The CFG++ direction, blended and then put through the *same* conditioning
+            // seam as the destination. Skipping the blend here would let a frozen token
+            // take its direction from an unprocessed prediction and drift out from under
+            // the mask on the deterministic path, which has no second blend to correct it.
+            //
+            // `nil` at `cfgPP == 0` rather than a blend that happens to be the identity:
+            // the steppers branch on nil to keep the standard path bit-identical, and
+            // `(1 - 0) * a + 0 * b` is not bit-identical to `a`.
+            let direction: MLXArray? = {
+                guard cfgPP > 0, let uncondX0 else { return nil }
+                let blended = cfgPP >= 1
+                    ? uncondX0
+                    : (1 - cfgPP) * combined.asType(.float32)
+                        + cfgPP * uncondX0.asType(.float32)
+                return Self.postProcess(denoised: blended.asType(combined.dtype),
+                                        denoiseMask: mask, cleanLatent: clean)
+            }()
             var next: MLXArray
             switch stepper {
             case .euler:
                 next = try eulerStep(sample: latent, denoised: processed, sigmas: sigmas,
-                                     index: index)
+                                     index: index, directionDenoised: direction)
             case let .ancestral(eta, sNoise, _):
                 next = try ancestralStep(sample: latent, denoised: processed, sigmas: sigmas,
-                                         index: index, noise: noise, eta: eta, sNoise: sNoise)
+                                         index: index, noise: noise, eta: eta, sNoise: sNoise,
+                                         directionDenoised: direction)
                 // **The blend goes on TWICE on the ancestral path, and only there.**
                 //
                 // The ancestral loop blends once into the x0 prediction (`processed`
@@ -643,6 +735,8 @@ public struct Sampler: Sendable {
                     explicitSigmas: [Float]? = nil,
                     stepper: Stepper = .euler,
                     retainHistory: Bool = true,
+                    evalCadence: Int = 1,
+                    cfgPP: Float = 0,
                     observer: ((Int, Streams) throws -> Void)? = nil) throws -> Trajectory {
         let sigmas: [Float]
         let stepCount: Int
@@ -699,16 +793,41 @@ public struct Sampler: Sendable {
                                   cleanLatent: cleanLatent,
                                   enabled: (plan.videoEnabled, plan.audioEnabled),
                                   lastDenoised: lastDenoised,
-                                  stepper: stepper, stepNoise: stepNoise)
+                                  stepper: stepper, stepNoise: stepNoise,
+                                  cfgPP: cfgPP)
             latents = result.latents
             lastDenoised = result.denoised
             // A step of lazy graph is two live streams; forcing here keeps the working set
             // to one step rather than the whole trajectory. The predictions are forced too
             // — a skipped step keeps one alive across iterations, and an unforced one
             // would hold the entire producing graph with it.
-            MLX.eval(latents.video, latents.audio,
-                     lastDenoised!.video, lastDenoised!.audio)
-            if retainHistory { states.append(latents) }
+            //
+            // `evalCadence` trades that bound for fewer sync points. Each force is a barrier
+            // where the GPU drains and the CPU rebuilds, and this port measures roughly
+            // 0.4 s of per-forward cost that does not scale with tokens — 8% of a forward at
+            // draft resolution. Forcing every n-th step amortises it across n steps.
+            //
+            // **It is bounded and not free.** n steps of graph stay live instead of one, so
+            // the working set grows with the cadence. The default is 1, which is the
+            // behaviour this loop has always had; raising it is a decision made against a
+            // measured memory headroom rather than a default anybody inherits. The last step
+            // always forces, because the caller is handed its result.
+            let isLast = index == stepCount - 1
+            if isLast || evalCadence <= 1 || (index + 1) % evalCadence == 0 {
+                MLX.eval(latents.video, latents.audio,
+                         lastDenoised!.video, lastDenoised!.audio)
+            }
+            // History forces regardless: appending unforced latents would hold every
+            // producing graph alive at once, which is the opposite of what a cadence is for.
+            //
+            // The **observer** deliberately does not force. The one this port passes reports
+            // a step number and never touches the latent, so forcing on its behalf would
+            // cancel the cadence at every call site that logs progress — which is all of
+            // them. An observer that does read the latent must force it itself.
+            if retainHistory {
+                MLX.eval(latents.video, latents.audio)
+                states.append(latents)
+            }
             try observer?(index, latents)
         }
         return Trajectory(latents: latents, states: states, passes: passes, sigmas: sigmas)

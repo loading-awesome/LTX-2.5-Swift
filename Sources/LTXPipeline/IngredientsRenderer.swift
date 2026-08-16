@@ -5,6 +5,7 @@ import Foundation
 import LTXCatalog
 import LTXFoundation
 import LTXModules
+import LTXRecipes
 import MLX
 
 /// Render from a prompt **and a reference sheet**, through an in-context LoRA.
@@ -41,18 +42,40 @@ public enum IngredientsRenderer {
         public var reference: URL
         public var prompt: String
         public var output: URL
+        /// The **output** width — what gets written. Equal to ``sampledWidth`` unless a
+        /// refine stage follows.
         public var width: Int
+        /// The **output** height. See ``width``.
         public var height: Int
+        /// The width stage 1 actually samples at, from the first stage's `scale`.
+        ///
+        /// Read from the recipe rather than derived here, and stored rather than computed,
+        /// because this is the number that decides whether rigid structure survives. A
+        /// subject occupying a 10x6 latent grid has nowhere to put mechanical detail, and a
+        /// refine that re-noises to 0.909 invents what is missing independently per frame —
+        /// which reads as melting. It is a recipe's decision, with a name attached.
+        public var sampledWidth: Int
+        /// The height stage 1 samples at. See ``sampledWidth``.
+        public var sampledHeight: Int
         public var frames: Int
         public var frameRate: Double
         public var steps: Int
         public var seed: UInt64
         /// Strength on the IC-LoRA overlay. 1.0 is how the adapter is meant to be applied.
         public var strength: Float
-        /// Run the second stage: x2 latent upsample then refine, doubling both dimensions.
+        /// Whether the recipe declared a refine stage after the draft.
         ///
-        /// The IC-LoRA pipeline is two-stage and so is this: stage 1 at
-        /// `--width x --height`, then a x2 latent upsample and a refine at double both.
+        /// **Not a speed setting, and it was sold as one.** Two-stage samples a draft at
+        /// half the output and lets an x2 upsample plus a short refine carry the rest. That
+        /// makes a *larger* output cheaper than rendering it natively — measured here at
+        /// 1.95x. It does not make a given output faster: comparing two-stage at 640x384
+        /// against single-stage at 640x384 is comparing a 320x192 draft against a 640x384
+        /// one, which is a quality cut wearing a speedup's clothes.
+        ///
+        /// So the recipes split on it. `ingredients` drafts and refines, because the
+        /// distilled schedule is cheap enough that the refine is most of its cost anyway.
+        /// `ingredients-prod` and `ingredients-prod-cfg` are single stage at full
+        /// resolution, and buy their time back by dropping guidance passes instead of pixels.
         ///
         /// The refine goes back through `referenceGuided`, **not**
         /// ``VideoUpscaler/refine(_:geometry:checkpoints:prompt:sigmas:note:)``. That was the
@@ -61,26 +84,82 @@ public enum IngredientsRenderer {
         /// with a bare transformer that had never seen the sheet — terrain melted and drifted,
         /// visibly worse than stage 1 alone. Stage 2 must carry the same conditioning stage 1
         /// did.
-        public var upsample: Bool
+        public var twoStage: Bool
+
         /// Stage-2 steps. The stage-2 schedule is shorter than stage 1's.
         public var refineSteps: Int
+        /// Non-nil runs stage 1 on the dev transformer's continuous schedule with real
+        /// guidance, instead of the distilled draft table. Four forwards per step rather
+        /// than one; the reference conditioning is unchanged.
+        public var guided: VideoUpscaler.Guided?
 
+        /// Stage 1's sigmas, from the recipe's own `SigmaPlan`.
+        public var stage1Sigmas: [Float]
+        /// Stage 2's sigmas when a refine follows, already scaled to the re-noise level.
+        public var stage2Sigmas: [Float]?
+
+        /// The stage's declared sampler. Decides CFG++ and the ancestral renoise.
+        public var sampler: SamplerKind = .eulerAncestral
+
+        /// Force the latent every n-th step instead of every step. Machine tuning, not a
+        /// recipe element: it changes what the render costs and not what it produces.
+        public var evalCadence: Int = 1
+        /// Block-0 residual change below which a step reuses the previous prediction. 0 is
+        /// the dense loop, which is what every measurement in this repo was taken with.
+        public var cacheThreshold: Double = 0
+
+        /// Every shape, schedule and guidance setting taken from a resolved recipe.
+        ///
+        /// **The geometry is not a parameter.** It was, and `--width 640 --height 384`
+        /// meaning "sample at 640x384" on one release and "output 640x384, sampled at
+        /// 320x192" on the next is what shipped a silent halving of the draft to anyone
+        /// whose flags had not changed. Rigid subjects melted, because a draft is not a
+        /// smaller picture — it is a picture with less structure in it, and a refine that
+        /// re-noises to 0.909 invents what is missing independently per frame.
+        ///
+        /// So the stage shapes come from ``RecipeStage/scale`` against a resolved output,
+        /// which is the same path `ltx render` has always taken. Changing what a stage
+        /// samples at now means editing a recipe that has a name and a summary, rather than
+        /// typing a different number.
         public init(reference: URL, prompt: String, output: URL,
-                    width: Int, height: Int, frames: Int, frameRate: Double = 24,
-                    steps: Int = 3, seed: UInt64 = 42, strength: Float = 1.0,
-                    upsample: Bool = false, refineSteps: Int = 3) {
+                    plan: ResolvedRecipe,
+                    seed: UInt64 = 42, strength: Float = 1.0,
+                    negativePrompt: String = "") throws {
+            guard let first = plan.stages.first else {
+                throw Failure.noStages(recipe: plan.recipeID)
+            }
             self.reference = reference
             self.prompt = prompt
             self.output = output
-            self.width = width
-            self.height = height
-            self.frames = frames
-            self.frameRate = frameRate
-            self.steps = steps
+            self.width = plan.output.width
+            self.height = plan.output.height
+            self.sampledWidth = first.shape.width
+            self.sampledHeight = first.shape.height
+            self.frames = plan.frames
+            self.frameRate = plan.frameRate
             self.seed = seed
             self.strength = strength
-            self.upsample = upsample
-            self.refineSteps = refineSteps
+            self.twoStage = plan.stages.count > 1
+            self.steps = first.stage.sigmas.steps
+            self.sampler = first.stage.sampler
+            self.stage1Sigmas = try first.stage.sigmas.sigmas()
+            // A second stage never starts at pure noise: it re-noises the upsampled draft to
+            // the recorded 0.909375 and descends from there. Scaling the stage's own curve
+            // to that head keeps its shape, which is what makes it a continuation of stage 1
+            // rather than a fresh render at the larger size.
+            let refine = plan.stages.dropFirst().first
+            self.stage2Sigmas = try refine.map {
+                try $0.stage.sigmas.sigmas(denoise: FlowSchedule.distilledStage2[0])
+            }
+            self.refineSteps = refine?.stage.sigmas.steps ?? 0
+            // Guidance follows the recipe onto the weights it belongs to. `nil` is the
+            // distilled arrangement — one forward per step, no guider built at all.
+            let videoGuide = first.stage.videoGuidance
+            self.guided = videoGuide == .distilled ? nil : VideoUpscaler.Guided(
+                negativePrompt: negativePrompt,
+                video: GuidanceParams(videoGuide),
+                audio: GuidanceParams(first.stage.audioGuidance),
+                steps: first.stage.sigmas.steps)
         }
     }
 
@@ -162,9 +241,16 @@ public enum IngredientsRenderer {
         case referenceFrames(Int)
         case audioCheckpointMissing
         case checkpointMissing(String, path: String)
+        case noStages(recipe: String)
 
         public var description: String {
             switch self {
+            case let .noStages(recipe):
+                // The grid check that used to live here is gone, and deliberately: it is
+                // `RecipeStage.shape(forOutput:)` that validates every stage against the 32
+                // grid, including the halved one, and it does it before a checkpoint is
+                // opened. A second rule here would be a second answer to the same question.
+                return "recipe '\(recipe)' declares no stages to sample"
             case let .referenceFrames(count):
                 return "the reference encoded to \(count) latent frames; a sheet should be a "
                     + "single still and encode to 1. A multi-frame reference is a different "
@@ -189,11 +275,14 @@ public enum IngredientsRenderer {
         // the guard sat at the decode, and a 14-minute two-stage render at 15 seconds threw
         // after both stages had finished. A precondition that fires at the end of the work it
         // was meant to protect is not a precondition.
+        // No grid check here. Every stage's shape was validated against the 32 grid by
+        // `RecipeStage.shape(forOutput:)` during resolution — before this call, and before a
+        // checkpoint was opened — so repeating it would be a second answer to one question.
         guard let audioVAE = checkpoints.audioVAE else {
             throw Failure.audioCheckpointMissing
         }
         for (what, url) in [("video VAE", checkpoints.videoVAE), ("audio VAE", audioVAE)]
-            + (options.upsample ? [("upsampler", checkpoints.upsampler)] : []) {
+            + (options.twoStage ? [("upsampler", checkpoints.upsampler)] : []) {
             guard FileManager.default.fileExists(atPath: url.path) else {
                 throw Failure.checkpointMissing(what, path: url.path)
             }
@@ -201,15 +290,18 @@ public enum IngredientsRenderer {
 
         // ---- Reference ---------------------------------------------------------------
         //
-        // Encoded at the *target's* resolution. `reference_downscale_factor` is 1 on this
-        // adapter, and the sheet's grid is the output dimensions divided by that factor —
-        // so for Ingredients the sheet occupies a full frame's worth of latent grid, not a
-        // thumbnail's.
+        // Encoded at the *stage's own* resolution. `reference_downscale_factor` is 1 on this
+        // adapter, and the sheet's grid is the stage's dimensions divided by that factor —
+        // so the sheet occupies a full frame's worth of latent grid, not a thumbnail's.
+        // Stage 1 samples at half the output, so its sheet is encoded at half too; stage 2
+        // re-encodes at full size below rather than reusing this one.
         var t = Date()
-        note?("encoding the reference sheet at \(options.width)x\(options.height)")
+        note?("encoding the reference sheet at "
+            + "\(options.sampledWidth)x\(options.sampledHeight)")
         let referenceLatent: MLXArray = try {
             let rgb = try MediaInput.image(at: options.reference,
-                                           height: options.height, width: options.width)
+                                           height: options.sampledHeight,
+                                           width: options.sampledWidth)
             let encoder = try VideoVAEEncoder(checkpoint: checkpoints.videoVAE)
             // bf16 for the same reason every other encode here uses it: an fp32 clip
             // promotes all 42 convolutions and computes more precisely than the encoder is
@@ -226,8 +318,8 @@ public enum IngredientsRenderer {
         }
 
         var geometry = DiTForward.Geometry(frames: options.frames,
-                                           height: options.height,
-                                           width: options.width,
+                                           height: options.sampledHeight,
+                                           width: options.sampledWidth,
                                            frameRate: options.frameRate)
         geometry.reference = DiTForward.Geometry.Reference(
             latentFrames: referenceLatent.dim(2),
@@ -240,10 +332,21 @@ public enum IngredientsRenderer {
 
         // ---- Stage 1 -----------------------------------------------------------------
         t = Date()
+        note?(options.twoStage
+              ? "stage 1 at \(geometry.width)x\(geometry.height), half of the"
+                  + " \(options.width)x\(options.height) output"
+              : "single stage at \(geometry.width)x\(geometry.height)")
+        // The recipe's own curve, passed explicitly rather than reconstructed from a step
+        // count. A `.fixed` plan is a recorded table and a `.continuous` one is built from
+        // `FlowSchedule` — the same distinction that decides which weights the stage belongs
+        // on, so re-deriving it here from `steps` alone would silently flatten the two.
         let stage1 = try VideoUpscaler.referenceGuided(
             references: [referenceLatent], geometry: geometry, checkpoints: checkpoints,
             prompt: options.prompt, seed: options.seed, steps: options.steps,
-            referenceStrength: options.strength, note: note)
+            referenceStrength: options.strength, explicitSigmas: options.stage1Sigmas,
+            guided: options.guided, sampler: options.sampler,
+            evalCadence: options.evalCadence,
+            cacheThreshold: options.cacheThreshold, note: note)
         MLX.eval(stage1.video, stage1.audio)
         MLX.Memory.clearCache()
         let sampleSeconds = -t.timeIntervalSinceNow
@@ -265,7 +368,7 @@ public enum IngredientsRenderer {
         var audioLatent = stage1.audio
         var outGeometry = geometry
         var refineSeconds: Double = 0
-        if options.upsample {
+        if options.twoStage {
             t = Date()
             note?("x2 latent upsample")
             let upscaled: MLXArray = try {
@@ -278,11 +381,11 @@ public enum IngredientsRenderer {
             MLX.Memory.clearCache()
 
             outGeometry = DiTForward.Geometry(frames: options.frames,
-                                              height: options.height * 2,
-                                              width: options.width * 2,
+                                              height: options.height,
+                                              width: options.width,
                                               frameRate: options.frameRate)
 
-            // The sheet again, at the doubled size. `reference_downscale_factor` is 1, so the
+            // The sheet again, at the full size. `reference_downscale_factor` is 1, so the
             // reference always matches the stage's own resolution — reusing stage 1's latent
             // here would append a half-size grid whose coordinates no longer line up.
             note?("re-encoding the reference at \(outGeometry.width)x\(outGeometry.height)")
@@ -310,6 +413,11 @@ public enum IngredientsRenderer {
             // result: terrain that melted and drifted, visibly worse than stage 1 alone.
             // Stage 2 has to carry the same conditioning stage 1 did, or it is not refining
             // the same picture.
+            // Each schedule on the weights it belongs to. `prod` is the dev transformer, and
+            // dev samples on `FlowSchedule` — handing it the recorded distilled table would
+            // be the same category of mistake as running 30 steps on distilled weights, in
+            // the other direction. Both curves start at the same 0.909375 re-noise level, so
+            // stage 2 is a continuation of stage 1 either way.
             note?("stage 2 refine at \(outGeometry.width)x\(outGeometry.height)")
             let stage2 = try VideoUpscaler.referenceGuided(
                 references: [stage2Reference], geometry: outGeometry, checkpoints: checkpoints,
@@ -317,7 +425,10 @@ public enum IngredientsRenderer {
                 seed: options.seed &+ DistilledRenderer.stage2NoiseSeedOffset,
                 steps: options.refineSteps, referenceStrength: options.strength,
                 initialVideo: try Sampler.patchifyVideo(upscaled),
-                explicitSigmas: FlowSchedule.distilledStage2, note: note)
+                explicitSigmas: options.stage2Sigmas,
+                guided: options.guided?.refining(steps: options.refineSteps),
+                sampler: options.sampler, evalCadence: options.evalCadence,
+                cacheThreshold: options.cacheThreshold, note: note)
             MLX.eval(stage2.video, stage2.audio)
             MLX.Memory.clearCache()
             videoLatent = stage2.video
